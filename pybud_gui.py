@@ -1,12 +1,14 @@
 import numpy as np
 import tifffile as tiff
 import csv
+from openpyxl import Workbook
 from PyQt5.QtCore import Qt, pyqtSignal, QThread,  QPointF, QMimeData
-from PyQt5.QtGui import QPainter, QPen, QColor, QPixmap, QImage, QIcon
-from PyQt5.QtWidgets import QApplication, QVBoxLayout, QLabel, QWidget, QSplitter, QTextEdit, QScrollArea, QScrollBar, QLineEdit, QPushButton, QHBoxLayout, QFormLayout, QFileDialog, QTableWidget, QAbstractItemView, QHeaderView, QTableWidgetItem, QMainWindow, QStatusBar
+from PyQt5.QtGui import QPainter, QPen, QColor, QPixmap, QImage, QIcon, QFont
+from PyQt5.QtWidgets import QApplication, QVBoxLayout, QLabel, QWidget, QSplitter, QTextEdit, QScrollArea, QScrollBar, QLineEdit, QPushButton, QHBoxLayout, QFormLayout, QFileDialog, QTableWidget, QAbstractItemView, QHeaderView, QTableWidgetItem, QMainWindow, QStatusBar, QMessageBox, QCheckBox
 from pybud import PyBud
 import roifile
-
+import json
+import os
 
 # then pybud object keeps track of all the settings
 pybud = PyBud()
@@ -14,13 +16,20 @@ pybud = PyBud()
 # Worker thread for running fit_cells in the background
 class FitCellsWorker(QThread):
     finished = pyqtSignal()
+    frame_processed = pyqtSignal(int)
 
     def __init__(self):
         super().__init__()
 
     def run(self):
-        pybud.fit_cells()
+        pybud.fit_cells(self._frame_processed)
         self.finished.emit()
+
+    def _frame_processed(self, frame_number):
+        self.frame_processed.emit(frame_number)
+
+    def stop(self):
+        pybud.stop()
 
 class ClickableImageLabel(QLabel):
     def __init__(self, parent=None):
@@ -31,6 +40,7 @@ class ClickableImageLabel(QLabel):
         self.offset_x = 0
         self.offset_y = 0
         self.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.show_edge_points = False
 
     def set_frame(self, frame):
         self.frame = frame
@@ -74,29 +84,40 @@ class ClickableImageLabel(QLabel):
                 painter.drawLine(x - 5, y - 5, x + 5, y + 5)
                 painter.drawLine(x - 5, y + 5, x + 5, y - 5)
 
-        painter.end()
-
         # draw all fitted cells
         for cell in pybud.cells:
             if cell.frame == self.frame:
-                ellipse = cell.ellipse
 
-                x = ellipse.get_x_center() * self.scale_factor
-                y = ellipse.get_y_center() * self.scale_factor
-                major = ellipse.get_major() * self.scale_factor
-                minor = ellipse.get_minor() * self.scale_factor
-                angle = ellipse.get_angle()
+                if self.show_edge_points:
+                    # Draw edge points as small dots
+                    pen.setColor(QColor(255, 0, 0))  # Red color for edge points
+                    painter.setPen(pen)
 
-                self.draw_ellipse(pixmap, x, y, major, minor, angle)
+                    for x, y in zip(cell.found_x[cell.pixel_found], cell.found_y[cell.pixel_found]):
+                        x = int(x * self.scale_factor)
+                        y = int(y * self.scale_factor)
+                        painter.drawPoint(x, y)  # Draw a small point
+
+                if cell.cell_found:
+                    ellipse = cell.ellipse
+
+                    x = ellipse.get_x_center() * self.scale_factor
+                    y = ellipse.get_y_center() * self.scale_factor
+                    major = ellipse.get_major() * self.scale_factor
+                    minor = ellipse.get_minor() * self.scale_factor
+                    angle = ellipse.get_angle()
+
+                    painter.save()
+                    painter.setPen(QPen(QColor(255, 255, 0, 128), 2))
+                    painter.translate(x, y)
+                    painter.rotate(angle)
+                    painter.drawEllipse(QPointF(0, 0), major, minor)
+                    painter.restore()
+                    
+
+        painter.end()
 
         self.setPixmap(pixmap)
-
-    def draw_ellipse(self, pixmap, x, y, major, minor, angle):
-        with QPainter(pixmap) as painter:
-            painter.setPen(QPen(QColor(255, 255, 0, 128), 2))
-            painter.translate(x, y)
-            painter.rotate(angle)
-            painter.drawEllipse(QPointF(0, 0), major, minor)
 
     def mousePressEvent(self, event):
 
@@ -153,43 +174,78 @@ class ImageViewer(QWidget):
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setWidget(self.image_label)
 
+        # Create a QLabel to display the frame number above the image
+        self.frame_number_label = QLabel("")
+        self.edge_points_checkbox = QCheckBox("Show Edge Points")
+        self.edge_points_checkbox.stateChanged.connect(self.show_edge_points)
+
         # Horizontal ScrollBar to scroll through frames
         self.scrollbar = QScrollBar(Qt.Horizontal)
         self.scrollbar.setMinimum(0)
         self.scrollbar.valueChanged.connect(self.update_frame)
 
-        measure_button = QPushButton("Measure")
-        measure_button.clicked.connect(self.measure)
+        self.measure_button = QPushButton("Measure")
+        self.measure_button.clicked.connect(self.measure)
+
+        stop_button = QPushButton("Stop")
+        stop_button.clicked.connect(self.stop)
+
+        # Create a horizontal layout for the buttons
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.measure_button)
+        button_layout.addWidget(stop_button)
+
+        top_layout = QHBoxLayout()
+        top_layout.addWidget(self.frame_number_label)
+        top_layout.addWidget(self.edge_points_checkbox)
 
         layout = QVBoxLayout()
-        layout.addWidget(self.scroll_area)        
+        layout.addLayout(top_layout)
+        layout.addWidget(self.scroll_area)
         layout.addWidget(self.scrollbar)
-        layout.addWidget(measure_button)
+        layout.addLayout(button_layout)  # Add the button layout here
 
         self.setLayout(layout)
+
+        self.worker = None
 
     def update(self):
         if pybud.img is not None:
             self.scrollbar.setMaximum(pybud.img.shape[0] - 1)
             self.update_frame(0)    # go to first frame and update
 
-    def update_frame(self, frame):
+    def update_frame(self, frame=0):
         self.image_label.set_frame(frame)
+        self.frame_number_label.setText(f"Frame: {frame + 1}")
+        self.scrollbar.setValue(frame)
 
     def measure(self):
         # Create a worker to run the fit_cells function in a background thread
         self.worker = FitCellsWorker()
         self.worker.finished.connect(self.on_fit_cells_finished)
+        self.worker.frame_processed.connect(self.update_frame)
         self.worker.start()
         self.measurement_started.emit()
-    
+        self.measure_button.setEnabled(False)
+
+    def show_edge_points(self, state):
+        self.image_label.show_edge_points = (state == Qt.Checked)
+        self.image_label.update_image_display()
+
     def on_fit_cells_finished(self):
         self.measurements_changed.emit()
+        self.worker = None
+        self.measure_button.setEnabled(True)
+
+    def stop(self):
+        if self.worker is not None:
+            self.worker.stop()
+
 
 class Settings(QWidget):
-    # Signal that emits the new file path when a file is selected
+    # Signal that emits when settings have changed
     settings_changed = pyqtSignal()
-
+    
     def __init__(self):
         super().__init__()
 
@@ -230,8 +286,81 @@ class Settings(QWidget):
         adjust_button.clicked.connect(self.adjust_settings)
         layout.addWidget(adjust_button)
 
+        clear_button = QPushButton("Clear Selections")
+        clear_button.clicked.connect(self.clear_selections)
+        layout.addWidget(clear_button)
+
+        export_settings_button = QPushButton("Export Settings")
+        export_settings_button.clicked.connect(self.export_settings)
+        layout.addWidget(export_settings_button)
+
+        import_settings_button = QPushButton("Import Settings")
+        import_settings_button.clicked.connect(self.import_settings)
+        layout.addWidget(import_settings_button)
+
+
+    def get_input_value(self, input_widget, value_type, field_name, min_value=None):
+        """
+        Helper method to validate and retrieve input values.
+        """
+        try:
+            value = value_type(input_widget.text())
+            if min_value is not None and value < min_value:
+                raise ValueError(f"{field_name} must be >= {min_value}.")
+            return value
+        except ValueError as e:
+            QMessageBox.warning(self, "Input Error", str(e))
+            return None
+    
+    def get_settings_values(self):
+        """
+        Retrieve and validate all settings values.
+        Returns a dictionary of settings or None if validation fails.
+        """
+        settings = {}
+
+        # Add file_path to settings
+        settings["file_path"] = self.file_path.text()
+
+        # Validate pixel size (float)
+        pixel_size = self.get_input_value(self.pixel_size_line, float, "Pixel Size")
+        if pixel_size is None: return None
+        settings["pixel_size"] = pixel_size
+
+        # Validate maximum cell radius (float)
+        cell_radius = self.get_input_value(self.cell_radius_line, float, "Maximum Cell Radius")
+        if cell_radius is None: return None
+        settings["cell_radius"] = cell_radius
+
+        # Validate cell edge size (float)
+        edge_size = self.get_input_value(self.cell_edge_size_line, float, "Cell Edge Size")
+        if edge_size is None: return None
+        settings["edge_size"] = edge_size
+
+        # Validate brightfield channel (int)
+        brightfield_channel = self.get_input_value(self.brightfield_channel_line, int, "Brightfield Channel")
+        if brightfield_channel is None: return None
+        settings["brightfield_channel"] = brightfield_channel
+
+        # Validate fluorescent channel 1 (int, must be >= 0)
+        fluorescent_channel1 = self.get_input_value(self.fluorescent_channel1_line, int, "Fluorescent Channel 1", min_value=0)
+        if fluorescent_channel1 is None: return None
+        settings["fluorescent_channel1"] = fluorescent_channel1
+
+        # Validate fluorescent channel 2 (int)
+        fluorescent_channel2 = self.get_input_value(self.fluorescent_channel2_line, int, "Fluorescent Channel 2")
+        if fluorescent_channel2 is None: return None
+        settings["fluorescent_channel2"] = fluorescent_channel2
+
+        # Validate relative minimum edge difference (float)
+        edge_rel_min = self.get_input_value(self.edge_rel_min_line, float, "Relative Minimum Edge Difference")
+        if edge_rel_min is None: return None
+        settings["edge_rel_min"] = edge_rel_min
+
+        return settings
+    
     def browse_file(self):
-        file_name, _ = QFileDialog.getOpenFileName(self, "Select Measurement File", "", "TIF Files (*.tif);;All Files (*)")
+        file_name, _ = QFileDialog.getOpenFileName(self, "Select Measurement File", "", "TIF Files (*.tif *.tiff *.TIF *.TIFF);;All Files (*)")
         if file_name:
             self.file_path.setText(file_name)
             self.load_image(file_name)
@@ -274,47 +403,109 @@ class Settings(QWidget):
     
     def adjust_settings(self):
         """
-        Validate all inputs using the helper function and proceed if all are valid.
+        Validate all inputs using the get_settings_values method and proceed if all are valid.
         """
-        # Validate pixel size (float)
-        pixel_size = self.get_input_value(self.pixel_size_line, float, "Pixel Size")
-        if pixel_size is None: return
+        # Retrieve settings values using the get_settings_values method
+        settings = self.get_settings_values()
+        if settings is None:
+            return  # Validation failed, do not proceed
 
-        # Validate maximum cell radius (int)
-        cell_radius = self.get_input_value(self.cell_radius_line, int, "Maximum Cell Radius")
-        if cell_radius is None: return
+        # Extract values from the settings dictionary
+        pixel_size = settings["pixel_size"]
+        cell_radius = settings["cell_radius"]
+        edge_size = settings["edge_size"]
+        brightfield_channel = settings["brightfield_channel"]
+        fluorescent_channel1 = settings["fluorescent_channel1"]
+        fluorescent_channel2 = settings["fluorescent_channel2"]
+        edge_rel_min = settings["edge_rel_min"]
 
-        # Validate cell edge size (int)
-        edge_size = self.get_input_value(self.cell_edge_size_line, int, "Cell Edge Size")
-        if edge_size is None: return
-
-        # Validate brightfield channel (int)
-        brightfield_channel = self.get_input_value(self.brightfield_channel_line, int, "Brightfield Channel")
-        if brightfield_channel is None: return
-
-        # Validate fluorescent channel 1 (int, must be >= 0)
-        fluorescent_channel1 = self.get_input_value(self.fluorescent_channel1_line, int, "Fluorescent Channel 1", min_value=0)
-        if fluorescent_channel1 is None: return
-
-        # Validate fluorescent channel 2 (int)
-        fluorescent_channel2 = self.get_input_value(self.fluorescent_channel2_line, int, "Fluorescent Channel 2")
-        if fluorescent_channel2 is None: return
-
-        # Validate relative minimum edge difference (float)
-        edge_rel_min = self.get_input_value(self.edge_rel_min_line, float, "Relative Minimum Edge Difference")
-        if edge_rel_min is None: return
-
+        # Prepare fluorescent channels list
         fl_channels = [fluorescent_channel1]
         if fluorescent_channel2 >= 0:
             fl_channels.append(fluorescent_channel2)
 
+        # Update global or class-level settings
         pybud.pixel_size = pixel_size
         pybud.cell_radius = cell_radius
         pybud.edge_size = edge_size
         pybud.bf_channel = brightfield_channel
         pybud.fl_channels = fl_channels
         pybud.edge_rel_min = edge_rel_min
+
+        # Emit signal to indicate settings have changed
         self.settings_changed.emit()
+
+    def clear_selections(self):
+        pybud.stop()
+        pybud.clear()
+        self.settings_changed.emit()
+
+    def export_settings(self):
+        """
+        Export the settings to a user-selected JSON file.
+        If the file exists, overwrite it with the new settings.
+        """
+        # Retrieve settings values
+        settings = self.get_settings_values()
+        if settings is None:
+            return  # Validation failed, do not proceed
+
+        # Include selections
+        settings["selections"] = pybud.selections
+
+        # Open a file dialog to select a file
+        file_name, _ = QFileDialog.getSaveFileName(self, "Save Settings", "", "JSON Files (*.json);;All Files (*)")
+        if not file_name:
+            return  # User canceled the file dialog
+
+        # Ensure the file has a .json extension
+        if not file_name.endswith(".json"):
+            file_name += ".json"
+
+        # Save the settings as JSON
+        try:
+            with open(file_name, 'w') as file:
+                json.dump(settings, file, indent=4)  # Pretty-print with indentation
+
+            QMessageBox.information(self, "Success", f"Settings saved successfully as {os.path.basename(file_name)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save settings: {str(e)}")
+    
+    def import_settings(self):
+        """
+        Import settings from a user-selected JSON file and update the UI fields accordingly.
+        """
+        # Open a file dialog to select a JSON file
+        file_name, _ = QFileDialog.getOpenFileName(self, "Load Settings", "", "JSON Files (*.json);;All Files (*)")
+        if not file_name:
+            return  # User canceled the file dialog
+
+        # Load the settings from the selected JSON file
+        try:
+            with open(file_name, 'r') as file:
+                settings = json.load(file)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load settings: {str(e)}")
+            return
+
+        # Update UI fields with the loaded settings
+        self.file_path.setText(settings.get("file_path", ""))
+        self.pixel_size_line.setText(str(settings.get("pixel_size", "0.0645")))
+        self.cell_radius_line.setText(str(settings.get("cell_radius", "4")))
+        self.cell_edge_size_line.setText(str(settings.get("edge_size", "1")))
+        self.brightfield_channel_line.setText(str(settings.get("brightfield_channel", "0")))
+        self.fluorescent_channel1_line.setText(str(settings.get("fluorescent_channel1", "1")))
+        self.fluorescent_channel2_line.setText(str(settings.get("fluorescent_channel2", "-1")))
+        self.edge_rel_min_line.setText(str(settings.get("edge_rel_min", "30")))
+        
+        # Load selections if available
+        pybud.selections = settings.get("selections", {})
+
+        # Emit signal to indicate settings have changed
+        self.settings_changed.emit()
+        
+        QMessageBox.information(self, "Success", "Settings imported successfully.")
+
 
 class MeasurementTable(QWidget):
     def __init__(self):
@@ -324,7 +515,7 @@ class MeasurementTable(QWidget):
         
         # Spreadsheet
         self.table = QTableWidget(10, 10)  # 10 rows, 4 columns
-        self.table.setHorizontalHeaderLabels(["Cell", "Frame", "X", "Y", "Major", "Minor", "Angle", "Volume", "Fluorescence1", "Fluorescence2"])
+        self.table.setHorizontalHeaderLabels(["Cell", "Frame", "X (µm)", "Y (µm)", "Major (µm)", "Minor (µm)", "Angle", "Volume", "Fluorescence1", "Fluorescence2"])
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)  # Disable editing
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)  # Make columns stretch
         layout.addWidget(self.table)
@@ -344,9 +535,10 @@ class MeasurementTable(QWidget):
 
     def populate_table(self):
         # Set the table to have as many rows as there are fitted cells
-        self.table.setRowCount(len(pybud.cells))
+        found_cells = [cell for cell in pybud.cells if cell.cell_found]
+        self.table.setRowCount(len(found_cells))
 
-        for row, cell in enumerate(pybud.cells):
+        for row, cell in enumerate(found_cells):
             fl1 = cell.fluorescence[0].mean
             fl2 = cell.fluorescence[1].mean if len(cell.fl_channels) > 1 else 0
 
@@ -360,33 +552,67 @@ class MeasurementTable(QWidget):
             self.table.setItem(row, 7, QTableWidgetItem(f"{cell.volume:.2f}"))
             self.table.setItem(row, 8, QTableWidgetItem(f"{fl1:.2f}"))
             self.table.setItem(row, 9, QTableWidgetItem(f"{fl2:.2f}"))
-    
-    def save_measurements(self):
-        # Open a file dialog to select where to save the CSV
-        options = QFileDialog.Options()
-        file_name, _ = QFileDialog.getSaveFileName(self, "Save CSV File", "", "CSV Files (*.csv);;All Files (*)", options=options)
-        
-        if file_name:
-            # Ensure the file has the right extension
-            if not file_name.endswith('.csv'):
-                file_name += '.csv'
 
-            # Open the file and write the table content to it
-            with open(file_name, mode='w', newline='') as file:
-                writer = csv.writer(file)
-                # Write headers
-                headers = [self.table.horizontalHeaderItem(i).text() for i in range(self.table.columnCount())]
-                writer.writerow(headers)
-                
-                # Write rows
-                for row in range(self.table.rowCount()):
-                    row_data = []
-                    for column in range(self.table.columnCount()):
-                        item = self.table.item(row, column)
-                        row_data.append(item.text() if item else '')
-                    writer.writerow(row_data)
-                    
-            print(f"Data saved to {file_name}")
+    def save_measurements(self):
+        # Open a file dialog to select where to save the file
+        options = QFileDialog.Options()
+        file_name, selected_filter = QFileDialog.getSaveFileName(
+            self, "Save File", "", "CSV Files (*.csv);;Excel Files (*.xlsx);;All Files (*)", options=options
+        )
+
+        if file_name:
+            if selected_filter == "CSV Files (*.csv)":
+                if not file_name.endswith('.csv'):
+                    file_name += '.csv'
+                self._save_as_csv(file_name)
+            elif selected_filter == "Excel Files (*.xlsx)":
+                if not file_name.endswith('.xlsx'):
+                    file_name += '.xlsx'
+                self._save_as_excel(file_name)
+            else:
+                # Default to CSV if the filter is not recognized
+                if not file_name.endswith('.csv'):
+                    file_name += '.csv'
+                self._save_as_csv(file_name)
+
+    def _save_as_csv(self, file_name):
+        """Save the table data to a CSV file."""
+        with open(file_name, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            # Write headers
+            headers = [self.table.horizontalHeaderItem(i).text() for i in range(self.table.columnCount())]
+            writer.writerow(headers)
+
+            # Write rows
+            for row in range(self.table.rowCount()):
+                row_data = []
+                for column in range(self.table.columnCount()):
+                    item = self.table.item(row, column)
+                    row_data.append(item.text() if item else '')
+                writer.writerow(row_data)
+
+        print(f"Data saved to {file_name}")
+
+    def _save_as_excel(self, file_name):
+        """Save the table data to an Excel file."""
+        workbook = Workbook()
+        sheet = workbook.active
+
+        # Write headers
+        headers = [self.table.horizontalHeaderItem(i).text() for i in range(self.table.columnCount())]
+        sheet.append(headers)
+
+        # Write rows
+        for row in range(self.table.rowCount()):
+            row_data = []
+            for column in range(self.table.columnCount()):
+                item = self.table.item(row, column)
+                row_data.append(item.text() if item else '')
+            sheet.append(row_data)
+
+        # Save the workbook
+        workbook.save(file_name)
+        print(f"Data saved to {file_name}")
 
     def copy_measurements(self):
         # Prepare the clipboard data
@@ -420,14 +646,24 @@ class MeasurementTable(QWidget):
             rois = []
 
             for i, cell in enumerate(pybud.cells):
-                x_points, y_points = cell.ellipse.generate_ellipse_points(100)
+                if cell.cell_found:
+                    x_points, y_points = cell.ellipse.generate_ellipse_points(100)
 
-                roi_fitted = roifile.ImagejRoi.frompoints(np.column_stack((x_points, y_points)))
-                roi_fitted.roitype = roifile.ROI_TYPE.POLYGON
-                roi_fitted.t_position = cell.frame + 1
-                roi_fitted.name = f"{i}_cell{cell.id}_{pybud.fitting_method}"
-                print("debug", cell.frame + 1)
-                rois.append(roi_fitted)
+                    roi_fitted = roifile.ImagejRoi.frompoints(np.column_stack((x_points, y_points)))
+                    roi_fitted.roitype = roifile.ROI_TYPE.POLYGON
+                    roi_fitted.t_position = cell.frame + 1
+                    roi_fitted.name = f"{i}_cell{cell.id}_{pybud.fitting_method}"
+                    print("debug", cell.frame + 1)
+                    rois.append(roi_fitted)
+
+            # Export selection points as point ROIs
+            for frame, selections in pybud.selections.items():
+                for j, (x, y) in enumerate(selections):
+                    roi_point = roifile.ImagejRoi.frompoints([[x, y]])
+                    roi_point.roitype = roifile.ROI_TYPE.POINT
+                    roi_point.t_position = frame + 1
+                    roi_point.name = f"frame{frame}_point{j}"
+                    rois.append(roi_point)
 
             roifile.roiwrite(file_name, rois, mode='w')
             print("ROi's exported")
