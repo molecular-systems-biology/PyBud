@@ -1,24 +1,24 @@
 import numpy as np
-from scipy import stats
 from .ellipse import Ellipse
 from .fluorescence import Fluorescence
 
 class Cell:
     def __init__(self,
                  img,
-                 pixel_size,            # pixel size
+                 pixel_size,
                  bf_channel,
                  fl_channels,
                  frame,
-                 x,                     # x coordinate in pixels
-                 y,                     # y coordinate in pixels
-                 id = -1,               # cell id
-                 cell_radius = 50,      # maximum cell radius in pixels
-                 edge_size = 15,        # maximum edge size in pixels
-                 edge_rel_min = 30,     # edge relative minimum difference (30%)
-                 fitting_method='algebraic'
+                 x,
+                 y,
+                 id = -1,
+                 cell_radius = 50,
+                 edge_size = 15,
+                 edge_rel_min = 30,
+                 fitting_method='algebraic',
+                 min_cell_radius_px = 0,
                  ):
-        
+
         self.img = img
         self.pixel_size = pixel_size
         self.bf_channel = bf_channel
@@ -31,9 +31,9 @@ class Cell:
         self.edge_size = edge_size
         self.edge_rel_min = edge_rel_min
         self.fitting_method = fitting_method
+        self.min_cell_radius_px = min_cell_radius_px
         self.img_height, self.img_width = img.shape[2], img.shape[3]
 
-        # output values
         self.cell_found = False
         self.mean_edge = 0
         self.ellipse = None
@@ -48,8 +48,7 @@ class Cell:
         if not self.cell_found:
             print(f"cell not found on frame {self.frame} x {self.x_selected} y {self.y_selected}")
             return
-        
-        # fit ellipse using the found edge coordinates
+
         self.ellipse = Ellipse(self.found_x[self.pixel_found], self.found_y[self.pixel_found], method=self.fitting_method)
 
         x, y = self.ellipse.generate_ellipse_points(360)
@@ -60,8 +59,8 @@ class Cell:
         self.minor = self.pixel_size * self.ellipse.get_minor()
         self.angle = self.ellipse.get_angle()
         self.edge_width = self.pixel_size * self.mean_edge
-        self.volume = 4 * np.pi * np.pow((self.major + self.minor) / 2, 3) / 3
-        
+        self.volume = 4 * np.pi * ((self.major + self.minor) / 2) ** 3 / 3
+
         for fl_channel in self.fl_channels:
             self.fluorescence.append(Fluorescence(self.img[self.frame, fl_channel, :, :], self.ellipse))
 
@@ -71,117 +70,138 @@ class Cell:
         and several filtering steps to eliminate false positives.
 
         Steps:
-        1. Extract a region of interest (ROI) to estimate background intensity.
-        2. For each of 360 angles, sample pixels radially from the selected center.
-        3. Along each radial line, detect the strongest intensity drop (edge).
-        4. Store edge location, distance from center, difference, and slope.
-        5. Apply a sequence of filters to remove noisy or invalid detections:
-        a. Global radius outlier removal (based on mean ± 2*std deviation).
-        b. Local radius jump filtering (removes sudden jumps using a window).
-        c. Difference filter (removes weak edges).
-        d. Slope filter (removes shallow edge slopes).
-        6. Check if a sufficient number of valid edges were detected (≥ 150).
-        7. Confirm all detected points are within valid image bounds.
-        8. Compute the mean edge width if the cell was successfully found.
+        1. Estimate background intensity as the modal value of the full image.
+        2. Sample pixels radially from the selected centre for all 360 angles at once
+           using NumPy array operations (replaces the per-angle Python loop).
+        3. Detect the strongest dark->bright transition in each radial profile using a
+           vectorised sliding-window scan (numpy.lib.stride_tricks.sliding_window_view).
+        4. Apply filters in the same order as BudJ:
+           a. Global radius outlier removal (mean ± 2σ).
+           b. Difference filter (mean − 1σ).
+           c. Slope filter (mean − 1σ).
+           d. Local radius jump filter (sliding window of 20).
+        5. Check if a sufficient number of valid edges were detected (≥ 180).
+        6. Confirm all detected points are within valid image bounds.
+        7. Compute the mean edge width if the cell was successfully found.
         """
+        from numpy.lib.stride_tricks import sliding_window_view
 
-        # Extract the selected brightfield image slice
         selected_image = self.img[self.frame, self.bf_channel, :, :]
 
-        # Define the ROI (region of interest) excluding a 50-pixel margin on all sides
-        roi = selected_image[50:self.img_height-100, 50:self.img_width-100]
-
-        # Estimate background using the mode; fallback to median if mode is zero
-        self.background = stats.mode(roi, axis=None).mode
+        # Background: modal intensity via histogram (robust for float and uint images,
+        # and ~10× faster than scipy.stats.mode which requires a full sort).
+        flat = selected_image.ravel().astype(np.float64)
+        counts, edges = np.histogram(flat, bins=512)
+        peak = int(np.argmax(counts))
+        self.background = float((edges[peak] + edges[peak + 1]) / 2.0)
         if self.background == 0:
-            self.background = np.median(roi)
+            self.background = 1.0
 
-        # Initialize data structures for storing edge information
-        self.pixel_found = np.full(360, False)
-        self.found_x = np.zeros(360)
-        self.found_y = np.zeros(360)
-        self.found_rad = np.zeros(360)
-        self.found_dif = np.zeros(360)
-        self.found_edge = np.zeros(360)
-        self.found_slope = np.zeros(360)
-        self.pixel_val_rel_dif = np.zeros(360)  # Store relative difference for each angle
+        R = self.cell_radius
+        W = self.edge_size
 
-        # Preallocate buffers for line sampling along each angle
-        vector_x = np.zeros(self.cell_radius + 1, dtype=np.int32)
-        vector_y = np.zeros(self.cell_radius + 1, dtype=np.int32)
-        vector_pixel_value = np.zeros(self.cell_radius + 1)
+        # ── 1. Build all 360 radial profiles at once ─────────────────────────
+        # angles: (360,)   radii: (R+1,)
+        angles = np.arange(360, dtype=np.float64) * (np.pi / 180.0)
+        radii  = np.arange(R + 1, dtype=np.float64)
 
-        # Iterate over all 360 degrees around the selected center point
-        for vector_angle in range(360):
+        # Pixel coordinates for every (angle, radius): shape (360, R+1)
+        xs_f = self.x_selected + np.outer(np.cos(angles), radii)
+        ys_f = self.y_selected + np.outer(np.sin(angles), radii)
+        xs   = np.round(xs_f).astype(np.int32)   # unclipped — kept for found_x/y
+        ys   = np.round(ys_f).astype(np.int32)
 
-            # Convert angle to radians
-            alpha = vector_angle * np.pi / 180.0
-            cosalpha, sinalpha = np.cos(alpha), np.sin(alpha)
+        in_bounds = ((xs >= 0) & (xs < self.img_width) &
+                     (ys >= 0) & (ys < self.img_height))
+        xs_c = np.clip(xs, 0, self.img_width  - 1)
+        ys_c = np.clip(ys, 0, self.img_height - 1)
 
-            # Sample pixel intensities along the radial line at the given angle
-            for i in range(self.cell_radius + 1):
-                vector_x[i] = self.x_selected + int(round(i * cosalpha))
-                vector_y[i] = self.y_selected + int(round(i * sinalpha))
+        profiles = selected_image[ys_c, xs_c].astype(np.float64)
+        profiles[~in_bounds] = self.background   # out-of-bounds pixels → background
 
-                if 0 <= vector_x[i] < self.img_width and 0 <= vector_y[i] < self.img_height:
-                    vector_pixel_value[i] = self.img[self.frame, self.bf_channel, vector_y[i], vector_x[i]]
-                else:
-                    vector_pixel_value[i] = self.background
+        # ── 2. Vectorised sliding-window edge detection ───────────────────────
+        # windows: (360, R-W+1, W)  — matches range(R-W+1) in the original loop
+        # Use profiles[:, :R] so the last index in any window is R-1, matching BudJ.
+        windows = sliding_window_view(profiles[:, :R], window_shape=W, axis=1)
 
-            limit_ptr = 0
-            max_dif = 0
+        pos_max = np.argmax(windows, axis=2)   # (360, R-W+1)
+        pos_min = np.argmin(windows, axis=2)   # (360, R-W+1)
 
-            # Slide a window along the radial line to find maximum intensity jump
-            for i in range(self.cell_radius - self.edge_size + 1):
-                window_pixels = vector_pixel_value[i:i+self.edge_size]
-                position_max = np.argmax(window_pixels)
-                position_min = np.argmin(window_pixels[position_max:]) + position_max
+        a_idx = np.arange(360)[:, None]
+        n_idx = np.arange(R - W + 1)[None, :]
+        val_max = windows[a_idx, n_idx, pos_max]   # (360, R-W+1)
+        val_min = windows[a_idx, n_idx, pos_min]   # (360, R-W+1)
 
-                if position_max < position_min:
-                    current_max = window_pixels[position_max]
-                    current_min = window_pixels[position_min]
-                    current_dif = current_max - current_min
-                    rel_dif = (100 * current_dif) / self.background
+        dif     = val_max - val_min
+        rel_dif = 100.0 * dif / self.background
 
-                    if current_dif > max_dif and rel_dif > self.edge_rel_min:
-                        self.pixel_found[vector_angle] = True
-                        limit_ptr = i + (position_max + position_min) // 2
-                        max_dif = current_dif
-                        edge = position_min - position_max
-                        self.pixel_val_rel_dif[vector_angle] = rel_dif
+        # Valid: dark->bright (pos_max > pos_min) and contrast strong enough
+        valid      = (pos_max > pos_min) & (rel_dif > self.edge_rel_min)
+        masked_dif = np.where(valid, dif, 0.0)
 
-            # Store the pixel and edge features if a valid edge is found
-            if self.pixel_found[vector_angle]:
-                self.found_x[vector_angle] = vector_x[limit_ptr]
-                self.found_y[vector_angle] = vector_y[limit_ptr]
-                dx = self.found_x[vector_angle] - self.x_selected
-                dy = self.found_y[vector_angle] - self.y_selected
-                self.found_rad[vector_angle] = np.sqrt(dx * dx + dy * dy)
-                self.found_dif[vector_angle] = max_dif
-                self.found_edge[vector_angle] = edge
-                self.found_slope[vector_angle] = max_dif / edge
-            else:
-                self.found_x[vector_angle] = 0
-                self.found_y[vector_angle] = 0
-                self.found_rad[vector_angle] = 0
-                self.found_dif[vector_angle] = 0
-                self.found_edge[vector_angle] = 0
-                self.found_slope[vector_angle] = 0
+        # Best window per angle: highest contrast among valid windows
+        best_n    = np.argmax(masked_dif, axis=1)    # (360,)
+        any_valid = np.any(valid, axis=1)             # (360,) bool
+
+        a_all = np.arange(360)
+        pm = pos_max[a_all, best_n]            # max position within best window
+        pn = pos_min[a_all, best_n]            # min position within best window
+        lp = best_n + (pm + pn) // 2          # edge radius index (limit_ptr)
+
+        # ── 3. Populate result arrays ─────────────────────────────────────────
+        self.pixel_found       = any_valid.copy()
+        self.found_x           = np.where(any_valid, xs[a_all, lp], 0).astype(np.float64)
+        self.found_y           = np.where(any_valid, ys[a_all, lp], 0).astype(np.float64)
+        dx                     = self.found_x - self.x_selected
+        dy                     = self.found_y - self.y_selected
+        self.found_rad         = np.where(any_valid, np.sqrt(dx*dx + dy*dy), 0.0)
+
+        # Reject edges closer to the seed than the minimum expected cell radius.
+        # This prevents strong interior gradients (bud necks, DIC phase artefacts)
+        # from producing false near-centre edge detections that bias the ellipse fit.
+        if self.min_cell_radius_px > 0:
+            self.pixel_found &= (self.found_rad >= self.min_cell_radius_px)
+
+        self.found_dif         = np.where(any_valid, masked_dif[a_all, best_n], 0.0)
+        edge_w                 = np.where(any_valid, (pm - pn).astype(np.float64), 0.0)
+        self.found_edge        = edge_w
+        safe_edge_w            = np.where(edge_w > 0, edge_w, 1.0)
+        self.found_slope       = np.where(any_valid & (edge_w > 0),
+                                          self.found_dif / safe_edge_w, 0.0)
+        self.pixel_val_rel_dif = np.where(any_valid,
+                                          100.0 * self.found_dif / self.background, 0.0)
 
         # Step 1: Radius-based global outlier removal
+        if not np.any(self.pixel_found):
+            return
         mean_rad = np.mean(self.found_rad[self.pixel_found])
         sdev_rad = np.std(self.found_rad[self.pixel_found])
         rad_mask = (self.found_rad >= mean_rad - 2 * sdev_rad) & (self.found_rad <= mean_rad + 2 * sdev_rad)
         self.pixel_found &= rad_mask
 
-        # Step 2: Jump-based local radius outlier removal using sliding window
+        # Step 2: Difference filter (remove weak edges) — now before jump filter, matching BudJ
+        if not np.any(self.pixel_found):
+            return
+        mean_dif = np.mean(self.found_dif[self.pixel_found])
+        sdev_dif = np.std(self.found_dif[self.pixel_found])
+        dif_mask = self.found_dif >= mean_dif - sdev_dif
+        self.pixel_found &= dif_mask
+
+        # Step 3: Slope filter (remove shallow slopes) — now before jump filter, matching BudJ
+        if not np.any(self.pixel_found):
+            return
+        mean_slope = np.mean(self.found_slope[self.pixel_found])
+        sdev_slope = np.std(self.found_slope[self.pixel_found])
+        slope_mask = self.found_slope >= mean_slope - sdev_slope
+        self.pixel_found &= slope_mask
+
+        # Step 4: Jump-based local radius outlier removal — now last, matching BudJ
         vector_angle = 0
         while vector_angle < 359:
             win_found_ctr = 0
             mean_win_rad = 0.0
             inc = 0
 
-            # Accumulate up to 20 valid points from the current angle
             while win_found_ctr < 20 and (vector_angle + inc) < 359:
                 if self.pixel_found[vector_angle + inc]:
                     mean_win_rad += self.found_rad[vector_angle + inc]
@@ -197,25 +217,12 @@ class Cell:
                         if self.found_rad[idx] > mean_win_rad + sdev_rad:
                             self.pixel_found[idx] = False
 
-                # Advance window by half jump length + 1
                 vector_angle += round(pixel_jumped_ctr / 2) + 1
             else:
                 vector_angle += 1
 
-        # Step 3: Difference filter (remove weak edges)
-        mean_dif = np.mean(self.found_dif[self.pixel_found])
-        sdev_dif = np.std(self.found_dif[self.pixel_found])
-        dif_mask = self.found_dif >= mean_dif - sdev_dif
-        self.pixel_found &= dif_mask
-
-        # Step 4: Slope filter (remove shallow slopes)
-        mean_slope = np.mean(self.found_slope[self.pixel_found])
-        sdev_slope = np.std(self.found_slope[self.pixel_found])
-        slope_mask = self.found_slope >= mean_slope - sdev_slope
-        self.pixel_found &= slope_mask
-
-        # Step 5: Validate if enough edge pixels were found
-        self.cell_found = np.sum(self.pixel_found) >= 150
+        # Step 5: Validate if enough edge pixels were found (≥ 180, matching BudJ)
+        self.cell_found = np.sum(self.pixel_found) >= 180
 
         # Step 6: Check if all valid points are within image bounds
         if self.cell_found:
@@ -226,7 +233,6 @@ class Cell:
         # Step 7: Compute mean edge width if cell is valid
         if self.cell_found:
             self.mean_edge = np.mean(self.found_edge[self.pixel_found])
-
 
     def __str__(self):
         return f"Cell ID: {self.id}, Pos: ({self.x_selected:.2f}, {self.y_selected:.2f}), Centroid: ({self.x_centroid:.2f}, {self.y_centroid:.2f}), Major: {self.major:.2f} µm, Minor: {self.minor:.2f} µm, Angle: {self.angle:.2f}°, Edge Width: {self.edge_width:.2f} µm"

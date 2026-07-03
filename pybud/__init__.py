@@ -1,10 +1,11 @@
-# __init__.py in the pybud package
-
-# Import the Cell class from cell.py
 from .cell import Cell
 from .ellipse import Ellipse
 from .fluorescence import Fluorescence
-from .pybud import PyBud
+from .tracker import PyBud
+from .autodetect import AutoDetect
+from .plots import Plots
 
-# Optionally, define what gets imported when using 'from pybud import *'
-__all__ = ['Cell',  'Ellipse', 'Fluorescence', 'PyBud']
+export_cell_plots = Plots.export_cell_plots
+
+__all__ = ['Cell', 'Ellipse', 'Fluorescence', 'PyBud', 'AutoDetect', 'Plots',
+           'export_cell_plots']

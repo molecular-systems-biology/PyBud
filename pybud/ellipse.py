@@ -31,27 +31,55 @@ class Ellipse:
                 f"Angle: {self.get_angle():.2f} degrees")
 
     # Geometric fitting using least squares
-    def ellipse_equation(self, params, x, y):
+    @staticmethod
+    def _geom_residuals(params, x, y):
         xc, yc, a, b, angle = params
-        cos_angle = np.cos(angle)
-        sin_angle = np.sin(angle)
+        ca, sa = np.cos(angle), np.sin(angle)
+        dx, dy = x - xc, y - yc
+        u = dx * ca + dy * sa
+        v = -dx * sa + dy * ca
+        return (u / a) ** 2 + (v / b) ** 2 - 1
 
-        x_rot = (x - xc) * cos_angle + (y - yc) * sin_angle
-        y_rot = -(x - xc) * sin_angle + (y - yc) * cos_angle
+    @staticmethod
+    def _geom_jac(params, x, y):
+        """Analytical Jacobian of _geom_residuals w.r.t. [xc, yc, a, b, angle]."""
+        xc, yc, a, b, angle = params
+        ca, sa = np.cos(angle), np.sin(angle)
+        dx, dy = x - xc, y - yc
+        u = dx * ca + dy * sa
+        v = -dx * sa + dy * ca
+        ua, vb = u / a, v / b
+        dr_dxc  = 2 * ua * (-ca) / a  + 2 * vb * sa  / b
+        dr_dyc  = 2 * ua * (-sa) / a  + 2 * vb * (-ca) / b
+        dr_da   = -2 * u ** 2 / a ** 3
+        dr_db   = -2 * v ** 2 / b ** 3
+        dr_dang = (2 * ua / a * (-dx * sa + dy * ca) +
+                   2 * vb / b * (-dx * ca - dy * sa))
+        return np.column_stack([dr_dxc, dr_dyc, dr_da, dr_db, dr_dang])
 
-        return (x_rot / a) ** 2 + (y_rot / b) ** 2 - 1
+    # Keep ellipse_equation for backward compatibility (get_r_squared / get_parameter_error)
+    def ellipse_equation(self, params, x, y):
+        return self._geom_residuals(params, x, y)
 
     def fit_geometric_ellipse(self):
-        # Initial guess for the parameters [x_center, y_center, major_axis, minor_axis, angle]
-        x_center_guess = np.mean(self.x)
-        y_center_guess = np.mean(self.y)
-        semi_major_axis_guess = (np.max(self.x) - np.min(self.x)) / 2
-        semi_minor_axis_guess = (np.max(self.y) - np.min(self.y)) / 2
-        angle_guess = 0
+        # Seed with the algebraic solution — it is already very close, cutting
+        # the number of LM iterations roughly in half vs. a naive bbox guess.
+        try:
+            initial_guess = self.fit_algebraic_ellipse()
+        except Exception:
+            initial_guess = np.array([
+                np.mean(self.x), np.mean(self.y),
+                (np.max(self.x) - np.min(self.x)) / 2,
+                (np.max(self.y) - np.min(self.y)) / 2,
+                0.0,
+            ])
 
-        initial_guess = [x_center_guess, y_center_guess, semi_major_axis_guess, semi_minor_axis_guess, angle_guess]
-
-        result = least_squares(self.ellipse_equation, initial_guess, args=(self.x, self.y))
+        result = least_squares(
+            self._geom_residuals, initial_guess,
+            jac=self._geom_jac,
+            args=(self.x, self.y),
+            method='lm',
+        )
         return result.x
 
     # Algebraic method integrated directly into the class
