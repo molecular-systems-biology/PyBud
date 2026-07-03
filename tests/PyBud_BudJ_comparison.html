@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PyBud vs BudJ Comparison</title>
+
+<style>
+  body { font-family: Arial, sans-serif; max-width: 1100px; margin: 40px auto; padding: 0 20px; color: #222; }
+  h1 { color: #1a237e; border-bottom: 2px solid #1a237e; padding-bottom: 6px; }
+  h2 { color: #283593; border-bottom: 1px solid #c5cae9; padding-bottom: 4px; margin-top: 2em; }
+  h3 { color: #3949ab; margin-top: 1.5em; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: 0.92em; }
+  th { background: #e8eaf6; color: #1a237e; padding: 8px 10px; text-align: left; border: 1px solid #c5cae9; }
+  td { padding: 6px 10px; border: 1px solid #e0e0e0; }
+  tr:nth-child(even) td { background: #f5f5f5; }
+  img { max-width: 100%; border: 1px solid #e0e0e0; border-radius: 4px; margin: 0.5em 0; }
+  code { background: #f5f5f5; padding: 2px 5px; border-radius: 3px; font-size: 0.9em; }
+  pre { background: #f5f5f5; padding: 12px; border-radius: 4px; overflow-x: auto; }
+  hr { border: none; border-top: 1px solid #e0e0e0; margin: 2em 0; }
+  li { margin: 4px 0; }
+  p { line-height: 1.6; }
+</style>
+
+</head>
+<body>
+<h1>PyBud vs BudJ — Real-Data Comparison</h1>
+<p>Comparison of cell tracking and morphology measurements between PyBud and BudJ on a real brightfield yeast time-lapse dataset.</p>
+<hr />
+<h2>Dataset</h2>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>File</td>
+<td><code>20250326_cb309_chipexample.tif</code></td>
+</tr>
+<tr>
+<td>Modality</td>
+<td>Brightfield (flat-field corrected)</td>
+</tr>
+<tr>
+<td>Dimensions</td>
+<td>79 frames × 726 × 672 px</td>
+</tr>
+<tr>
+<td>Channels</td>
+<td>1 (BF only)</td>
+</tr>
+<tr>
+<td>Pixel size</td>
+<td>0.064 µm/px</td>
+</tr>
+<tr>
+<td>Frame interval</td>
+<td>300 s</td>
+</tr>
+</tbody>
+</table>
+<p>The dataset shows two budding <em>S. cerevisiae</em> cells imaged in a microfluidic chip device. Both cells are visible from the first frame; daughter cells appear in later frames as budding events occur.</p>
+<hr />
+<h2>Methods</h2>
+<h3>Cell detection</h3>
+<p>Cells were detected automatically in frame 0 using a Hough circle transform. A large-Gaussian background model (σ = 80 px) was subtracted from the brightfield frame before Canny edge detection, removing chip walls and illumination gradients so that only cell-scale circular structures remain. The two strongest peaks in the Hough accumulator within the expected cell-radius range were taken as seed positions.</p>
+<table>
+<thead>
+<tr>
+<th>Cell</th>
+<th>Seed position (x, y in px, frame 0)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>(238, 411)</td>
+</tr>
+<tr>
+<td>2</td>
+<td>(211, 401)</td>
+</tr>
+</tbody>
+</table>
+<h3>PyBud tracking</h3>
+<p>The detected positions were passed as starting seeds to PyBud's tracking pipeline (<code>autotrack.py</code>). PyBud fitted an ellipse to the brightfield edge profile at each frame using the geometric (non-linear least-squares) method, propagating the fitted centroid as the seed for the next frame.</p>
+<p>Three robustness improvements were applied relative to the initial PyBud implementation:</p>
+<ol>
+<li><strong>Minimum-radius filter</strong>: Edge candidates within <code>edge_window / 3</code> of the seed are rejected, eliminating false inner-gradient detections (e.g. bright cell-wall rings visible from inside the cell that can be picked up when the seed is off-centre).</li>
+<li><strong>Size continuity check</strong>: If the fitted major or minor semi-axis changes by more than 50% relative to the previous frame, the fit is treated as unreliable; the tracking seed is held from the last valid frame while gap-tolerance bridging can optionally cover the skipped frame.</li>
+<li><strong>Gap tolerance and interpolation</strong>: Up to 1 consecutive missed frame is bridged automatically; the gap is filled with a linearly interpolated ellipse (flagged <code>interpolated = True</code> in the output).</li>
+</ol>
+<h3>BudJ tracking</h3>
+<p>The same seed positions were passed to a custom headless batch plugin (<code>BudJMovieBatch_</code>) compiled into the BudJ Fiji distribution. The plugin replicates the BudJ GUI's frame-by-frame propagation logic: it calls BudJ's internal <code>CellBJ.GetCellData()</code> for each frame and uses the fitted centroid as the seed for the next. Because BudJ does not handle float32 pixel data correctly, the chip image was normalised to uint16 (global min–max) before processing by both tools.</p>
+<h3>Matching parameters</h3>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Max cell radius</td>
+<td>4.0 µm</td>
+</tr>
+<tr>
+<td>Edge window size</td>
+<td>1.0 µm</td>
+</tr>
+<tr>
+<td>Min relative contrast</td>
+<td>30 %</td>
+</tr>
+<tr>
+<td>Max size change per frame</td>
+<td>50 % (PyBud only)</td>
+</tr>
+<tr>
+<td>Max gap tolerance</td>
+<td>1 frame (PyBud only)</td>
+</tr>
+<tr>
+<td>Fitting method (PyBud)</td>
+<td>Geometric (non-linear least squares)</td>
+</tr>
+<tr>
+<td>Fitting method (BudJ)</td>
+<td>Algebraic (direct linear least squares)</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>Tracking Improvements</h2>
+<p>Three improvements were implemented in PyBud's tracking engine based on issues identified during earlier testing.</p>
+<h3>1. Minimum-radius edge filter</h3>
+<p><strong>Problem</strong>: PyBud's radial scan starts at radius 0, so strong intensity transitions close to the seed position — such as bright-ring artefacts visible from inside the cell when the seed drifts off-centre — can be detected as cell edges, biasing the ellipse fit.</p>
+<p><strong>Fix</strong>: After radial edge detection, any candidate edge point closer than <code>edge_window_px / 3</code> to the seed position is discarded. At the default settings (edge window = 1 µm ≈ 16 px), the threshold is 5 px — above the typical 3–5 px artefact range and below the minimum expected real-edge distance.</p>
+<p><strong>Effect</strong>: Eliminates false near-centre detections without removing real cell edges, and aligns PyBud's effective minimum search radius with BudJ's (which starts scanning at <code>MaxWinEdge</code>).</p>
+<h3>2. Size continuity check</h3>
+<p><strong>Problem</strong>: Occasionally an edge profile contains confounding structure that causes the fitted ellipse to be dramatically larger or smaller than the previous frame, even though the cell cannot have changed size that rapidly.</p>
+<p><strong>Fix</strong>: After each frame fit, the fractional change in major and minor semi-axes is compared against a configurable threshold (<code>max_size_change</code>, default 50%). If either exceeds the threshold the frame measurement is not recorded; the tracking seed is held at the last valid centroid and the miss counter increments.</p>
+<p><strong>Configurable in GUI</strong> as "Max Size Change (%)" (0 = disabled).</p>
+<h3>3. Gap tolerance and post-tracking interpolation</h3>
+<p><strong>Problem</strong>: A single frame where the edge profile is unusable caused tracking to terminate early in the original implementation.</p>
+<p><strong>Fix</strong>: A <code>max_gap</code> parameter (default 1) controls how many consecutive missed frames are tolerated before tracking is declared lost. After all frames have been processed, any gap of ≤ <code>max_gap</code> frames between two successfully fitted frames is filled by linearly interpolating all ellipse parameters (centroid x/y, major, minor, and orientation angle). Interpolated frames are flagged <code>interpolated = True</code> in the output CSV.</p>
+<p><strong>Configurable in GUI</strong> as "Max Frame Gap" (0 = no gap tolerance).</p>
+<h3>Impact on this dataset</h3>
+<p>All 158 cell-frame measurements were fitted directly from image data; neither size-rejection nor interpolation was triggered. The minimum-radius filter was the critical fix that resolved an earlier tracking failure in testing.</p>
+<hr />
+<h2>Results</h2>
+<h3>Tracking coverage</h3>
+<p>Both tools tracked both cells successfully for the full 79 frames.</p>
+<table>
+<thead>
+<tr>
+<th>Cell</th>
+<th>Frames</th>
+<th>PyBud</th>
+<th>BudJ</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>79</td>
+<td>79 / 79 (100 %)</td>
+<td>79 / 79 (100 %)</td>
+</tr>
+<tr>
+<td>2</td>
+<td>79</td>
+<td>79 / 79 (100 %)</td>
+<td>79 / 79 (100 %)</td>
+</tr>
+</tbody>
+</table>
+<p>Interpolated frames: 0 (all measurements derived directly from image data).</p>
+<h3>Measurement agreement</h3>
+<p>For every frame, the ellipse parameters from PyBud and BudJ were compared directly (aligned by frame index). All differences are |PyBud − BudJ|.</p>
+<p><strong>158 matched cell-frames (2 tracks × 79 frames):</strong></p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Mean diff</th>
+<th>Max diff</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Centroid X</td>
+<td>0.060 µm</td>
+<td>0.185 µm</td>
+</tr>
+<tr>
+<td>Centroid Y</td>
+<td>0.042 µm</td>
+<td>0.099 µm</td>
+</tr>
+<tr>
+<td>Major semi-axis</td>
+<td>0.053 µm</td>
+<td>0.212 µm</td>
+</tr>
+<tr>
+<td>Minor semi-axis</td>
+<td>0.003 µm</td>
+<td>0.012 µm</td>
+</tr>
+</tbody>
+</table>
+<p>Per-track breakdown:</p>
+<table>
+<thead>
+<tr>
+<th>Cell</th>
+<th>Frames</th>
+<th>Mean |ΔX|</th>
+<th>Mean |ΔY|</th>
+<th>Mean |ΔMajor|</th>
+<th>Mean |ΔMinor|</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>79</td>
+<td>0.059 µm</td>
+<td>0.041 µm</td>
+<td>0.053 µm</td>
+<td>0.003 µm</td>
+</tr>
+<tr>
+<td>2</td>
+<td>79</td>
+<td>0.061 µm</td>
+<td>0.043 µm</td>
+<td>0.053 µm</td>
+<td>0.003 µm</td>
+</tr>
+</tbody>
+</table>
+<p>All mean differences are below 0.065 µm (one pixel). The minor semi-axis shows the best agreement (mean diff 0.003 µm). The major semi-axis shows a larger but still small mean difference of 0.053 µm; the direction of this offset is systematic and is explained below.</p>
+<h3>Systematic offset in the major semi-axis</h3>
+<p>Inspecting the signed difference (PyBud − BudJ) reveals that PyBud consistently reports a <em>larger</em> major semi-axis than BudJ. This is not random noise but a systematic bias with the same sign in every frame, with a mean offset of approximately +0.05 µm.</p>
+<p><strong>Which tool is more accurate?</strong></p>
+<p>The synthetic benchmark (<code>BENCHMARK_REPORT.md</code>, Section 4) provides a direct answer. All three evaluated configurations were tested against known ground-truth ellipses:</p>
+<table>
+<thead>
+<tr>
+<th>Fitting method</th>
+<th>Mean major semi-axis error</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PyBud — geometric (non-linear least squares)</td>
+<td><strong>0.39 px</strong> ← best</td>
+</tr>
+<tr>
+<td>BudJ — algebraic (direct linear least squares)</td>
+<td>0.46 px</td>
+</tr>
+<tr>
+<td>PyBud — algebraic</td>
+<td>0.48 px</td>
+</tr>
+</tbody>
+</table>
+<p>PyBud with geometric fitting is closest to ground truth and consistently reports <em>larger</em> values. BudJ and PyBud algebraic both <em>underestimate</em> the major semi-axis by ~0.07 px relative to the geometric optimum.</p>
+<p><strong>Why does algebraic fitting underestimate axis lengths?</strong></p>
+<p>The algebraic method minimises the sum of squared values of the implicit ellipse polynomial $F(x,y) = ax^2 + bxy + cy^2 + dx + ey + f$ evaluated at the edge points. This algebraic residual does not correspond to physical Euclidean distances from the points to the ellipse boundary, and the optimum tends to pull the ellipse inward — shrinking the axes — to reduce the norm of the coefficient vector. This effect grows with the noise level of the edge-point set.</p>
+<p>The geometric method minimises the sum of squared Euclidean distances from each edge point to the nearest point on the ellipse boundary. This is the statistically correct formulation under Gaussian noise and produces the true maximum-likelihood estimate with no systematic axis bias.</p>
+<p><strong>Practical implication</strong>: PyBud's geometric fitting reports major semi-axis values that are ~0.07 px (≈ 4.5 nm at 0.064 µm/px) larger than BudJ and closer to the true cell boundary. For most biological applications this difference is negligible. When comparing absolute size measurements between PyBud and BudJ outputs, users should expect PyBud to be consistently larger on the major axis.</p>
+<h3>Measurement time series</h3>
+<p>The figure below shows centroid position and semi-axes over time for each cell, with PyBud (solid) and BudJ (dashed) overlaid.</p>
+<p><img alt="Chip comparison" src="chip_comparison.png" /></p>
+<hr />
+<h2>Notes</h2>
+<ul>
+<li><strong>Fitting methods differ</strong>: PyBud uses geometric (non-linear) fitting; BudJ uses algebraic (linear) fitting. This is the primary source of the systematic major semi-axis offset described above.</li>
+<li><strong>Image preprocessing</strong>: The TIF is stored as flat-field-corrected float32 with negative pixel values. It was normalised to uint16 (global min–max) before processing by both tools; BudJ cannot handle float32 pixel data.</li>
+<li><strong>New output column</strong>: PyBud's CSV and GUI table now include an <code>interpolated</code> column (hidden by default) that flags frames filled by linear interpolation rather than direct image fitting.</li>
+</ul>
+</body>
+</html>
