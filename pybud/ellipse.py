@@ -108,7 +108,7 @@ class Ellipse:
         # Select the eigenvector corresponding to the positive eigenvalue
         con = 4 * eigvecs[0] * eigvecs[2] - eigvecs[1]**2
         pos_eig_idx = np.argmax(con > 0)
-        a = eigvecs[:, pos_eig_idx]
+        a = np.real(eigvecs[:, pos_eig_idx])
 
         # Final conic coefficients
         conic_coeffs = np.concatenate((a, T @ a))
