@@ -11,12 +11,13 @@ class Cell:
                  frame,
                  x,
                  y,
-                 id = -1,
+                 cell_id = -1,
                  cell_radius = 50,
                  edge_size = 15,
                  edge_rel_min = 30,
                  fitting_method='algebraic',
                  min_cell_radius_px = 0,
+                 fl_channel_offsets = None,
                  ):
 
         self.img = img
@@ -26,12 +27,16 @@ class Cell:
         self.frame = frame
         self.x_selected = x
         self.y_selected = y
-        self.id = id
+        self.id = cell_id
         self.cell_radius = cell_radius
         self.edge_size = edge_size
         self.edge_rel_min = edge_rel_min
         self.fitting_method = fitting_method
         self.min_cell_radius_px = min_cell_radius_px
+        # {fl_channel: (dx, dy)} pixel offset correcting for a fixed chromatic/
+        # optical misalignment between that channel and the brightfield-fitted
+        # outline — see PyBud.estimate_fl_offset(). Missing entries mean (0, 0).
+        self.fl_channel_offsets = fl_channel_offsets or {}
         self.img_height, self.img_width = img.shape[2], img.shape[3]
 
         self.cell_found = False
@@ -62,34 +67,55 @@ class Cell:
         self.volume = 4 * np.pi * ((self.major + self.minor) / 2) ** 3 / 3
 
         for fl_channel in self.fl_channels:
-            self.fluorescence.append(Fluorescence(self.img[self.frame, fl_channel, :, :], self.ellipse))
+            offset = self.fl_channel_offsets.get(fl_channel, (0.0, 0.0))
+            self.fluorescence.append(
+                Fluorescence(self.img[self.frame, fl_channel, :, :], self.ellipse, offset=offset)
+            )
 
     def get_cell_edge(self):
         """
         Detects the cell boundary in a brightfield image using radial edge detection
-        and several filtering steps to eliminate false positives.
+        and several filtering steps to eliminate false positives, matching BudJ's
+        algorithm. Each step is a dedicated method below, run in order:
 
-        Steps:
-        1. Estimate background intensity as the modal value of the full image.
-        2. Sample pixels radially from the selected centre for all 360 angles at once
-           using NumPy array operations (replaces the per-angle Python loop).
-        3. Detect the strongest dark->bright transition in each radial profile using a
-           vectorised sliding-window scan (numpy.lib.stride_tricks.sliding_window_view).
-        4. Apply filters in the same order as BudJ:
-           a. Global radius outlier removal (mean ± 2σ).
-           b. Difference filter (mean − 1σ).
-           c. Slope filter (mean − 1σ).
-           d. Local radius jump filter (sliding window of 20).
-        5. Check if a sufficient number of valid edges were detected (≥ 180).
-        6. Confirm all detected points are within valid image bounds.
-        7. Compute the mean edge width if the cell was successfully found.
+        1. :meth:`_estimate_background` — modal intensity of the full image.
+        2. :meth:`_detect_radial_edges` — sample pixels radially from the selected
+           centre for all 360 angles at once and find the strongest dark→bright
+           transition in each radial profile (both fully vectorised).
+        3. :meth:`_filter_radius_outliers` — global radius outlier removal (mean ± 2σ).
+        4. :meth:`_filter_weak_edges` — difference filter (mean − 1σ).
+        5. :meth:`_filter_shallow_slopes` — slope filter (mean − 1σ).
+        6. :meth:`_filter_local_radius_jumps` — local radius jump filter (sliding
+           window of 20).
+        7. :meth:`_finalize_cell_found` — require ≥ 180 valid edges, confirm all
+           detected points are within image bounds, and compute the mean edge width.
+
+        Any step that filters out every remaining candidate point stops the method
+        early, leaving ``cell_found`` ``False``.
         """
-        from numpy.lib.stride_tricks import sliding_window_view
+        self._estimate_background()
+        self._detect_radial_edges()
 
+        if not np.any(self.pixel_found):
+            return
+        self._filter_radius_outliers()
+
+        if not np.any(self.pixel_found):
+            return
+        self._filter_weak_edges()
+
+        if not np.any(self.pixel_found):
+            return
+        self._filter_shallow_slopes()
+
+        self._filter_local_radius_jumps()
+        self._finalize_cell_found()
+
+    def _estimate_background(self):
+        """Background: modal intensity via histogram (robust for float and uint images,
+        and ~10x faster than scipy.stats.mode which requires a full sort)."""
         selected_image = self.img[self.frame, self.bf_channel, :, :]
 
-        # Background: modal intensity via histogram (robust for float and uint images,
-        # and ~10× faster than scipy.stats.mode which requires a full sort).
         flat = selected_image.ravel().astype(np.float64)
         counts, edges = np.histogram(flat, bins=512)
         peak = int(np.argmax(counts))
@@ -97,10 +123,20 @@ class Cell:
         if self.background == 0:
             self.background = 1.0
 
+    def _detect_radial_edges(self):
+        """
+        Sample 360 radial profiles around the selected centre and find the
+        strongest dark->bright transition in each, using a vectorised sliding
+        window scan (numpy.lib.stride_tricks.sliding_window_view) instead of a
+        per-angle Python loop.
+        """
+        from numpy.lib.stride_tricks import sliding_window_view
+
+        selected_image = self.img[self.frame, self.bf_channel, :, :]
         R = self.cell_radius
         W = self.edge_size
 
-        # ── 1. Build all 360 radial profiles at once ─────────────────────────
+        # ── Build all 360 radial profiles at once ─────────────────────────
         # angles: (360,)   radii: (R+1,)
         angles = np.arange(360, dtype=np.float64) * (np.pi / 180.0)
         radii  = np.arange(R + 1, dtype=np.float64)
@@ -119,8 +155,8 @@ class Cell:
         profiles = selected_image[ys_c, xs_c].astype(np.float64)
         profiles[~in_bounds] = self.background   # out-of-bounds pixels → background
 
-        # ── 2. Vectorised sliding-window edge detection ───────────────────────
-        # windows: (360, R-W+1, W)  — matches range(R-W+1) in the original loop
+        # ── Vectorised sliding-window edge detection ───────────────────────
+        # windows: (360, R-W+1, W)  — matches range(R-W+1) in a per-angle loop
         # Use profiles[:, :R] so the last index in any window is R-1, matching BudJ.
         windows = sliding_window_view(profiles[:, :R], window_shape=W, axis=1)
 
@@ -148,7 +184,7 @@ class Cell:
         pn = pos_min[a_all, best_n]            # min position within best window
         lp = best_n + (pm + pn) // 2          # edge radius index (limit_ptr)
 
-        # ── 3. Populate result arrays ─────────────────────────────────────────
+        # ── Populate result arrays ─────────────────────────────────────────
         self.pixel_found       = any_valid.copy()
         self.found_x           = np.where(any_valid, xs[a_all, lp], 0).astype(np.float64)
         self.found_y           = np.where(any_valid, ys[a_all, lp], 0).astype(np.float64)
@@ -171,31 +207,37 @@ class Cell:
         self.pixel_val_rel_dif = np.where(any_valid,
                                           100.0 * self.found_dif / self.background, 0.0)
 
-        # Step 1: Radius-based global outlier removal
-        if not np.any(self.pixel_found):
-            return
+    def _filter_radius_outliers(self):
+        """Global radius-based outlier removal (mean ± 2σ). The radius standard
+        deviation computed here is reused by :meth:`_filter_local_radius_jumps`."""
         mean_rad = np.mean(self.found_rad[self.pixel_found])
-        sdev_rad = np.std(self.found_rad[self.pixel_found])
-        rad_mask = (self.found_rad >= mean_rad - 2 * sdev_rad) & (self.found_rad <= mean_rad + 2 * sdev_rad)
+        self._radius_sdev = np.std(self.found_rad[self.pixel_found])
+        rad_mask = (self.found_rad >= mean_rad - 2 * self._radius_sdev) & \
+                   (self.found_rad <= mean_rad + 2 * self._radius_sdev)
         self.pixel_found &= rad_mask
 
-        # Step 2: Difference filter (remove weak edges) — now before jump filter, matching BudJ
-        if not np.any(self.pixel_found):
-            return
+    def _filter_weak_edges(self):
+        """Remove edges whose contrast is more than 1σ below the mean (weak edges)."""
         mean_dif = np.mean(self.found_dif[self.pixel_found])
         sdev_dif = np.std(self.found_dif[self.pixel_found])
         dif_mask = self.found_dif >= mean_dif - sdev_dif
         self.pixel_found &= dif_mask
 
-        # Step 3: Slope filter (remove shallow slopes) — now before jump filter, matching BudJ
-        if not np.any(self.pixel_found):
-            return
+    def _filter_shallow_slopes(self):
+        """Remove edges whose slope is more than 1σ below the mean (shallow edges)."""
         mean_slope = np.mean(self.found_slope[self.pixel_found])
         sdev_slope = np.std(self.found_slope[self.pixel_found])
         slope_mask = self.found_slope >= mean_slope - sdev_slope
         self.pixel_found &= slope_mask
 
-        # Step 4: Jump-based local radius outlier removal — now last, matching BudJ
+    def _filter_local_radius_jumps(self):
+        """
+        Local radius-jump outlier removal: slide a 20-point window (in valid
+        edges) around the circle and drop any point whose radius exceeds the
+        window's mean by more than the global radius σ from
+        :meth:`_filter_radius_outliers`.
+        """
+        sdev_rad = self._radius_sdev
         vector_angle = 0
         while vector_angle < 359:
             win_found_ctr = 0
@@ -221,16 +263,16 @@ class Cell:
             else:
                 vector_angle += 1
 
-        # Step 5: Validate if enough edge pixels were found (≥ 180, matching BudJ)
+    def _finalize_cell_found(self):
+        """Require >= 180 valid edges, confirm they're within image bounds, and
+        compute the mean edge width if the cell is accepted."""
         self.cell_found = np.sum(self.pixel_found) >= 180
 
-        # Step 6: Check if all valid points are within image bounds
         if self.cell_found:
             x_valid = (self.found_x[self.pixel_found] >= 2) & (self.found_x[self.pixel_found] <= self.img_width - 2)
             y_valid = (self.found_y[self.pixel_found] >= 2) & (self.found_y[self.pixel_found] <= self.img_height - 2)
             self.cell_found = np.all(x_valid & y_valid)
 
-        # Step 7: Compute mean edge width if cell is valid
         if self.cell_found:
             self.mean_edge = np.mean(self.found_edge[self.pixel_found])
 

@@ -192,13 +192,21 @@ class Ellipse:
     def get_parameter_error(self):
         return np.std(self.ellipse_equation(self.params, self.x, self.y))
     
-    def get_mask(self, img_height, img_width):
+    def get_mask(self, img_height, img_width, offset=(0.0, 0.0)):
+        """
+        Boolean ellipse mask over an `img_height` x `img_width` grid.
+
+        `offset` shifts the mask's center by `(dx, dy)` pixels without
+        touching the ellipse's own fitted position — used to correct for a
+        fixed pixel-level misalignment between a brightfield-fitted outline
+        and a different (e.g. fluorescence) channel's image.
+        """
         # Create a sparse grid of coordinates
         y, x = np.ogrid[:img_height, :img_width]
 
         # Adjust coordinates by shifting 0.5 to align with pixel centers
-        x = x - self.get_x_center()
-        y = y - self.get_y_center()
+        x = x - (self.get_x_center() + offset[0])
+        y = y - (self.get_y_center() + offset[1])
 
         # Rotation matrix components
         cos_angle = np.cos(np.radians(self.get_angle()))

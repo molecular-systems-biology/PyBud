@@ -3,9 +3,9 @@ from scipy import stats
 from .ellipse import Ellipse
 
 class Fluorescence:
-    def __init__(self, img: np.ndarray, ellipse: Ellipse):
+    def __init__(self, img: np.ndarray, ellipse: Ellipse, offset=(0.0, 0.0)):
         height, width = img.shape
-        mask = ellipse.get_mask(height, width)
+        mask = ellipse.get_mask(height, width, offset=offset)
         pixels_inside_ellipse = img[mask]
 
         # Background: modal value of the full fluorescence image (matching BudJ)

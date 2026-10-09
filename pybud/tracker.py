@@ -149,6 +149,11 @@ class PyBud:
         self.pixel_size   = 0.0645   # µm per pixel
         self.bf_channel   = 0
         self.fl_channels  = [1]
+        # {fl_channel: (dx, dy)} pixel offset correcting a fixed chromatic/
+        # optical misalignment between that channel and the brightfield-fitted
+        # outline. Set manually or via estimate_fl_offset(); applied to newly
+        # fitted cells only (existing Cell objects already baked theirs in).
+        self.fl_channel_offsets = {}
         self.cell_radius  = 4        # µm — max radial search distance from seed
         self.edge_size    = 1        # µm — edge-detection sliding-window width
         self.edge_rel_min = 30       # %  — minimum relative edge contrast
@@ -159,6 +164,15 @@ class PyBud:
         self.max_gap           = 1    # consecutive missed frames before stopping (0 = immediate)
         self.max_size_change   = 0.5  # max fractional change in radius per frame (0 = disabled)
         self.overlap_threshold = 0.1  # IoU-like fraction above which a duplicate is discarded
+        # Budding yeast keep growing: without this, the radial search window
+        # (cell_radius) stays fixed at its starting size for the whole track,
+        # so a cell that eventually grows past it simply becomes unfindable —
+        # not caught by max_size_change, which only rejects implausible jumps
+        # *after* a fit, it doesn't widen the search before one. Each frame's
+        # effective search radius is max(cell_radius, last_known_major *
+        # (1 + max_growth_per_frame) ** frames_since_last_fit) — compounding
+        # across any gap frames. 0 = disabled (fixed cell_radius, old behaviour).
+        self.max_growth_per_frame = 0.05
 
         # Background correction applied to the BF channel before edge detection
         self.bg_correction_sigma = 0.0  # Gaussian sigma in µm; 0 = disabled
@@ -177,6 +191,8 @@ class PyBud:
         self.bud_distance_factor = 1.2
         self.bud_size_ratio      = 0.8
         self.mother_ids          = {}   # populated by fit_cells()
+
+        self.lost_cells  = []   # [(cell_id, frame, reason), ...] populated by fit_cells()
 
         self._should_run = False
         self._lock       = threading.Lock()
@@ -295,10 +311,26 @@ class PyBud:
         self.cells.clear()
         self.processed_cells.clear()
         self.mother_ids.clear()
+        self.lost_cells.clear()
 
     def stop(self):
         """Signal any running :meth:`fit_cells` call to stop after the current frame."""
         self._should_run = False
+
+    def get_pending_ids(self):
+        """
+        Map each not-yet-fitted seed to the cell id it will receive when
+        :meth:`fit_cells` runs, using the same enumeration order as
+        :meth:`fit_cells` itself: frame order, then insertion order within
+        a frame, starting at 1.
+        """
+        ids = {}
+        cell_id = 1
+        for start_frame, coords in self.selections.items():
+            for x, y in coords:
+                ids[(start_frame, x, y)] = cell_id
+                cell_id += 1
+        return ids
 
     # ------------------------------------------------------------------
     # Tracking pipeline
@@ -323,26 +355,120 @@ class PyBud:
             Called with the current frame index after each frame is processed.
             Intended for progress-bar updates from a GUI thread.
         """
-        self._should_run = True
         self.cells.clear()
         self.processed_cells.clear()
+        self.lost_cells.clear()
 
+        seeds = {
+            cid: (start_frame, float(x), float(y), None)   # no known size yet for a fresh seed
+            for (start_frame, x, y), cid in self.get_pending_ids().items()
+        }
+        self._run_tracking(seeds, callback)
+
+    def refit_range(self, start_frame, end_frame, callback=None, cell_ids=None):
+        """
+        Re-run tracking for frames ``[start_frame, end_frame]`` only
+        (inclusive, 0-based), leaving every other frame's results untouched.
+
+        Use this after tweaking fitting/tracking settings to fix a specific
+        problematic stretch of a movie without re-measuring everything.
+        Existing tracks are continued from their last fitted position just
+        before ``start_frame``; any seed manually placed inside the window
+        (via :meth:`add_selection`) starts a new track there.
+
+        Parameters
+        ----------
+        start_frame, end_frame : int
+            Inclusive 0-based frame range to re-fit.
+        callback : callable(int), optional
+            Called with the current frame index after each frame is processed.
+        cell_ids : iterable[int], optional
+            Restrict the re-fit to these track IDs — every other cell's
+            results inside the window are left exactly as they were, even
+            if the new settings would have changed how it fits. Omit (or
+            ``None``) to re-fit every cell active in the window, as before.
+        """
+        if self.img is None:
+            return
+
+        start_frame = max(0, int(start_frame))
+        end_frame   = min(self.img.shape[0] - 1, int(end_frame))
+        if start_frame > end_frame:
+            return
+
+        cell_ids = set(cell_ids) if cell_ids is not None else None
+
+        seeds = self._collect_refit_seeds(start_frame, end_frame, cell_ids)
+        if not seeds:
+            return
+
+        self._clear_frame_range(start_frame, end_frame, cell_ids)
+        self._run_tracking(seeds, callback, end_frame=end_frame)
+
+    def _collect_refit_seeds(self, start_frame, end_frame, cell_ids=None):
+        """
+        Seeds for :meth:`refit_range`: every track alive just before
+        ``start_frame`` (continued from its last fitted position) plus any
+        manual seed placed inside the window (numbered as :meth:`fit_cells`
+        would number it) — restricted to ``cell_ids`` if given. Returns
+        ``{cell_id: (seed_frame, x, y, seed_major)}`` — continuing tracks carry
+        their last known size so growth-aware search radius (see
+        :attr:`max_growth_per_frame`) applies from the window's first frame
+        too, not just frames 2+; fresh seeds carry ``None`` (no size known yet).
+        """
+        seeds = {}
+        for cell in self.cells:
+            if (cell.cell_found and cell.frame == start_frame - 1
+                    and not getattr(cell, 'interpolated', False)
+                    and (cell_ids is None or cell.id in cell_ids)):
+                seeds[cell.id] = (start_frame,
+                                  cell.ellipse.get_x_center(),
+                                  cell.ellipse.get_y_center(),
+                                  cell.ellipse.get_major())
+
+        for (sf, x, y), cid in self.get_pending_ids().items():
+            if start_frame <= sf <= end_frame and (cell_ids is None or cid in cell_ids):
+                seeds.setdefault(cid, (sf, float(x), float(y), None))
+
+        return seeds
+
+    def _clear_frame_range(self, start_frame, end_frame, cell_ids=None):
+        """
+        Drop cached/measured results inside ``[start_frame, end_frame]`` so
+        they get redone — restricted to ``cell_ids`` if given, so untouched
+        cells' existing results in the window survive even though the
+        window as a whole is being re-fit.
+        """
+        def in_scope(cid):
+            return cell_ids is None or cid in cell_ids
+
+        self.cells = [c for c in self.cells
+                      if not (start_frame <= c.frame <= end_frame and in_scope(c.id))]
+
+        for key in list(self.processed_cells.keys()):
+            frame = key[0]
+            if start_frame <= frame <= end_frame and in_scope(self.processed_cells[key].id):
+                del self.processed_cells[key]
+
+        self.lost_cells = [lc for lc in self.lost_cells
+                           if not (start_frame <= lc[1] <= end_frame and in_scope(lc[0]))]
+
+    def _run_tracking(self, seeds, callback, end_frame=None):
+        """
+        Shared pipeline for :meth:`fit_cells` and :meth:`refit_range`: track
+        every seed in parallel, then gap-fill, overlap-filter, and re-detect
+        mother-daughter relationships over the (possibly partial) result.
+        """
+        self._should_run = True
         self._work_img = (self._apply_bg_correction()
                           if self.bg_correction_sigma > 0
                           else self.img)
 
-        tasks = []
-        cell_id = 1
-        for start_frame, coords in self.selections.items():
-            for x, y in coords:
-                tasks.append((cell_id, start_frame, float(x), float(y)))
-                cell_id += 1
-
         with ThreadPoolExecutor() as executor:
-            futures = {
-                executor.submit(self._track_cell, cid, sf, cx, cy, callback): cid
-                for cid, sf, cx, cy in tasks
-            }
+            futures = [
+                executor.submit(self._track_cell, cid, sf, x, y, callback, end_frame, seed_major)
+                for cid, (sf, x, y, seed_major) in seeds.items()
+            ]
             for future in as_completed(futures):
                 future.result()
 
@@ -355,13 +481,23 @@ class PyBud:
         self._filter_overlapping()
         self._detect_mother_daughter()
 
-    def _track_cell(self, cell_id, start_frame, x, y, callback):
-        """Propagate a single cell seed forward through all frames."""
+    def _track_cell(self, cell_id, start_frame, x, y, callback, end_frame=None, seed_major=None):
+        """
+        Propagate a single cell seed forward through frames
+        ``[start_frame, end_frame]``. ``seed_major`` is the cell's already-known
+        size (pixels) when continuing an existing track — e.g. from
+        :meth:`refit_range` — so the very first frame of the run also benefits
+        from growth-aware radius expansion, not just frames 2+.
+        """
         consecutive_misses = 0
-        prev_major = None
+        prev_major = None          # drives the max_size_change rejection check, below
         prev_minor = None
+        last_known_major = seed_major   # drives growth-aware search-radius expansion only
 
-        for frame in range(start_frame, self._work_img.shape[0]):
+        last_frame = (self._work_img.shape[0] - 1 if end_frame is None
+                      else min(end_frame, self._work_img.shape[0] - 1))
+
+        for frame in range(start_frame, last_frame + 1):
             if not self._should_run:
                 return
 
@@ -374,6 +510,7 @@ class PyBud:
                 if not cached.cell_found:
                     consecutive_misses += 1
                     if consecutive_misses > self.max_gap:
+                        self._report_lost(cell_id, frame, "no further match found")
                         return
                     continue
                 consecutive_misses = 0
@@ -381,20 +518,39 @@ class PyBud:
                 y          = cached.ellipse.get_y_center()
                 prev_major = cached.ellipse.get_major()
                 prev_minor = cached.ellipse.get_minor()
+                last_known_major = prev_major
                 if callback is not None:
                     callback(frame)
                 continue
 
+            base_radius_px = int(np.ceil(self.cell_radius / self.pixel_size))
             edge_size_px = int(np.ceil(self.edge_size / self.pixel_size))
+            if last_known_major is not None and self.max_growth_per_frame > 0:
+                # Compound over any missed frames since the last successful fit,
+                # so a gap doesn't leave the window too tight for how much the
+                # cell could plausibly have grown in the meantime. The fitted
+                # major is the cell's actual edge, not the search radius that
+                # found it -- the radial edge detector needs the window to
+                # extend roughly edge_size_px *past* the true edge to see a
+                # clean dark-to-bright transition (the same margin a
+                # fixed cell_radius has to leave by hand), so project that
+                # same margin forward or the window stays one step too tight.
+                growth = (1 + self.max_growth_per_frame) ** (consecutive_misses + 1)
+                projected_px = int(np.ceil(last_known_major * growth)) + edge_size_px
+                search_radius_px = max(base_radius_px, projected_px)
+            else:
+                search_radius_px = base_radius_px
+
             cell = Cell(
                 self._work_img, self.pixel_size, self.bf_channel, self.fl_channels,
                 frame, x, y, cell_id,
-                int(np.ceil(self.cell_radius / self.pixel_size)),
+                search_radius_px,
                 edge_size_px,
                 self.edge_rel_min,
                 fitting_method=self.fitting_method,
                 # Reject near-centre edges (bud necks, DIC artefacts) matching BudJ behaviour
                 min_cell_radius_px=max(1, edge_size_px // 3),
+                fl_channel_offsets=self.fl_channel_offsets,
             )
 
             with self._lock:
@@ -436,6 +592,7 @@ class PyBud:
                 y          = cell.ellipse.get_y_center()
                 prev_major = cell.ellipse.get_major()
                 prev_minor = cell.ellipse.get_minor()
+                last_known_major = prev_major
                 print(f"cell found on channel {self.bf_channel} "
                       f"at frame {frame} x {x:.1f} y {y:.1f}")
             else:
@@ -444,10 +601,17 @@ class PyBud:
                     print(f"WARNING: frame {frame} skipped — {reject_reason}. "
                           f"Consecutive misses: {consecutive_misses}/{self.max_gap}")
                 if consecutive_misses > self.max_gap:
+                    self._report_lost(cell_id, frame, reject_reason or "no edge found")
                     return
 
             if callback is not None:
                 callback(frame)
+
+    def _report_lost(self, cell_id, frame, reason):
+        """Record that a track was given up on at ``frame`` (too many consecutive misses)."""
+        print(f"Cell {cell_id} lost at frame {frame + 1} ({reason})")
+        with self._lock:
+            self.lost_cells.append((cell_id, frame, reason))
 
     def _fill_gaps(self):
         """
@@ -635,6 +799,94 @@ class PyBud:
             bg  = gaussian_filter(bf, sigma=sigma_px)
             work[t, self.bf_channel] = (bf - bg + float(np.mean(bg))).astype(np.float32)
         return work
+
+    def estimate_fl_offset(self, fl_channel, search_radius_px=8, max_samples=80):
+        """
+        Estimate a fixed pixel offset between the brightfield-fitted cell
+        outlines and ``fl_channel``, for correcting a chromatic/optical
+        misalignment between channels (e.g. from a dichroic or a second
+        camera). Tries every integer ``(dx, dy)`` shift within
+        ``search_radius_px`` and picks the one that, averaged over a sample
+        of already-fitted cells, best separates "inside the (shifted) cell
+        outline" from "outside it" in the fluorescence signal.
+
+        Call this *after* :meth:`fit_cells` (or :meth:`refit_range`) has
+        produced some fitted outlines to compare against. The result is
+        **not** applied automatically — store it in
+        :attr:`fl_channel_offsets` yourself, then re-run fitting so new
+        :class:`~pybud.cell.Cell` objects pick it up (cells already fitted
+        keep whatever offset was active when they were fitted).
+
+        Parameters
+        ----------
+        fl_channel : int
+            Channel index to estimate the offset for.
+        search_radius_px : int
+            Shifts from ``-search_radius_px`` to ``+search_radius_px`` (both
+            axes) are tried.
+        max_samples : int
+            Cap on how many fitted cells to use — evenly sampled if there
+            are more, to keep runtime bounded on long movies.
+
+        Returns
+        -------
+        tuple or None
+            ``(dx, dy, best_score, zero_score)`` — the best shift, its mean
+            inside-minus-outside contrast score, and that same score at
+            zero offset (for gauging how much the shift actually helped).
+            ``None`` if there are no fitted, non-interpolated cells to
+            compare against.
+        """
+        if self.img is None:
+            return None
+
+        samples = [c for c in self.cells if c.cell_found and not getattr(c, 'interpolated', False)]
+        if not samples:
+            return None
+        if len(samples) > max_samples:
+            step = len(samples) / max_samples
+            samples = [samples[int(i * step)] for i in range(max_samples)]
+
+        H, W = self.img.shape[2], self.img.shape[3]
+        R = int(search_radius_px)
+
+        totals = {}   # (dx, dy) -> [sum_of_contrast, n_samples]
+        for cell in samples:
+            ellipse = cell.ellipse
+            cx, cy  = ellipse.get_x_center(), ellipse.get_y_center()
+            pad     = int(ellipse.get_major()) + R + 2
+
+            x0, x1 = max(0, int(cx - pad)), min(W, int(cx + pad) + 1)
+            y0, y1 = max(0, int(cy - pad)), min(H, int(cy + pad) + 1)
+            if x1 - x0 <= 2 * R or y1 - y0 <= 2 * R:
+                continue   # too close to the image edge to search the full range safely
+
+            crop = self.img[cell.frame, fl_channel, y0:y1, x0:x1].astype(np.float64)
+            crop_h, crop_w = crop.shape
+
+            for dy in range(-R, R + 1):
+                for dx in range(-R, R + 1):
+                    # Shifted mask within this cell's local crop (see Ellipse.get_mask):
+                    # a candidate (dx, dy) means "sample the fluorescence at the
+                    # brightfield position plus this offset".
+                    mask = ellipse.get_mask(crop_h, crop_w, offset=(dx - x0, dy - y0))
+                    n_in = int(mask.sum())
+                    if n_in == 0 or n_in == mask.size:
+                        continue
+                    contrast = crop[mask].mean() - crop[~mask].mean()
+                    key = (dx, dy)
+                    if key in totals:
+                        totals[key][0] += contrast
+                        totals[key][1] += 1
+                    else:
+                        totals[key] = [contrast, 1]
+
+        if not totals:
+            return None
+
+        avg_scores = {k: total / n for k, (total, n) in totals.items()}
+        best_dx, best_dy = max(avg_scores, key=avg_scores.get)
+        return best_dx, best_dy, avg_scores[(best_dx, best_dy)], avg_scores.get((0, 0), 0.0)
 
     @staticmethod
     def _ellipse_mask_crop(ellipse, y0, y1, x0, x1):
