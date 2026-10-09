@@ -61,7 +61,7 @@ PyBud/
 ## Quick Start
 
 1. Click **Browse** and open a multi-channel, multi-frame `.tif` file. Pixel size and time step are auto-populated from the file metadata when available.
-2. Check that the **Image** parameters (pixel size, channel indices) are correct, then click **Adjust Settings**.
+2. Check that the **Image** parameters (pixel size, channel indices) are correct. There's no separate "apply" step — these take effect automatically the moment you click Measure, an Auto-Detect button, or Re-fit Frame Range.
 3. **Left-click** on a cell in the image to place a seed point (green cross). Seeds can be placed on any frame; PyBud tracks forward from that frame automatically.
 4. Click **Measure**. Fitted ellipses appear in yellow; the results table populates with per-frame measurements.
 5. Click **Export Plots** to save a time-series figure for each tracked cell.
@@ -78,24 +78,42 @@ The window is divided into three areas:
 |---|---|
 | **Left panel** | All parameters, grouped by function. Scrollable when the panel is narrow. |
 | **Image panel** | Brightfield (or fluorescence) image with fitted ellipses, scale bar, and frame navigation. |
-| **Results table** | Per-frame measurements for all tracked cells. Click any row to jump to that frame. |
+| **Results table** | Per-frame measurements for all tracked cells, accumulated across runs. Click any row to jump to that frame. |
 
 ### Image panel controls
 
 | Action | Effect |
 |---|---|
-| Left-click on cell | Place a seed point (green cross) |
+| Left-click on cell | Place a seed point (green cross), labelled with the cell number it will get once measured |
 | Left-click on existing cross | Remove that seed |
-| Right-click | Zoom in ×1.25 |
-| Right-click + Shift | Zoom out ×0.75 |
+| Left / Right arrow | Previous / next frame |
+| Up / Down arrow | Scroll the image up/down (handy when zoomed in) |
+| Ctrl or Alt + Up / Down arrow | Previous / next channel |
+| Alt + scroll wheel | Previous / next channel |
+| Ctrl + scroll wheel | Zoom in/out, centred on the cursor |
+| + / − keys | Zoom in / out |
+| **−** / **+** / **Reset Zoom** buttons | Zoom out, zoom in, or reset to 100% (current level shown as a percentage between the buttons) |
 | Scrollbar | Navigate through frames |
 | Channel dropdown | Switch between brightfield and fluorescence channels |
+| **Help** button | Opens a reference covering every control, button, and settings parameter |
 
-A **scale bar** is shown in the bottom-right corner of the image and updates automatically when zooming. An **orange dashed line** connects a mother cell to its bud whenever both are visible in the same frame.
+These shortcuts work from anywhere in the image panel (the image itself, the channel dropdown, the zoom buttons, etc.) — not just when the image is directly focused — while text fields keep their normal typing behaviour.
+
+The current **frame number** is shown above the image. A **scale bar** is shown in the bottom-right corner and updates automatically when zooming. An **orange dashed line** connects a mother cell to its bud whenever both are visible in the same frame. If a tracked cell is lost partway through (e.g. it drifts out of the search radius or the edge contrast drops too low), a message naming the cell and the frame it was lost on appears in the status bar once fitting finishes.
 
 ### Clicking a row in the table
 
-Selecting any row in the results table immediately jumps the image to the corresponding frame and highlights that cell's ellipse in **cyan**. All other fitted cells remain yellow.
+Click any row to jump the image to that frame and highlight the corresponding cell's ellipse in **cyan** (all other fitted cells remain yellow); arrow keys in the table do the same. Ctrl/shift-click to select multiple rows at once, e.g. before using **Delete Selected Rows**.
+
+### Correcting a shifted fluorescence channel
+
+Some setups (a second camera, a dichroic/filter cube switch) introduce a small, fixed pixel misalignment between the brightfield channel and a fluorescence channel, so the brightfield-fitted outline doesn't sit exactly over the fluorescent signal. Switching the **channel dropdown** to a fluorescence channel reveals a **FL Offset** row above the image:
+
+1. Run **Measure** (or **Auto-Detect & Measure**) at least once, so there are fitted cell outlines to compare against.
+2. Switch to the affected fluorescence channel and click **Auto** in the FL Offset row. PyBud tries small pixel shifts and picks the one that best lines up the already-fitted outlines with that channel's actual signal (by maximising inside-vs-outside intensity contrast, averaged over a sample of fitted cells), then fills in the **X**/**Y** fields.
+3. Click **Measure** (or **Re-fit Frame Range**) again — the offset only affects *newly* fitted cells, so this step actually applies the correction to the measurements.
+
+The X/Y fields can also be set by hand if you already know the shift, or to fine-tune the automatic estimate. The offset is purely about *where to sample* each fluorescence channel — it never changes the fitted outline shape itself, is independent per channel, and (like other settings) round-trips through **Export Settings** / **Import Settings**.
 
 ---
 
@@ -115,6 +133,8 @@ Selecting any row in the results table immediately jumps the image to the corres
 | Brightfield channel | 0 | Zero-based channel index used for edge detection. |
 | FL channel 1 | 1 | First fluorescence channel. Mean intensity inside the fitted ellipse is measured. Set to −1 to disable. |
 | FL channel 2 | −1 | Second fluorescence channel. Set to −1 to disable. |
+
+If a fluorescence channel is spatially shifted relative to the brightfield outline (e.g. a second camera or filter cube), see [Correcting a shifted fluorescence channel](#correcting-a-shifted-fluorescence-channel) — the per-channel pixel offset is set via the **FL Offset** row in the image panel, not here.
 
 ### Time
 
@@ -138,6 +158,7 @@ Selecting any row in the results table immediately jumps the image to the corres
 | Field | Default | Description |
 |---|---|---|
 | Max size change (%) | 50 | Maximum permitted change in major or minor axis between consecutive frames. Detections exceeding this are treated as missed frames. |
+| Max growth per frame (%) | 5 | How much a budding cell is allowed to grow each frame. Widens the per-frame search radius beyond **Max cell radius** as the cell gets bigger, so a steadily growing cell doesn't outgrow the fixed radius and become unfindable partway through the movie. Set to 0 to disable (fixed radius, the old behaviour). |
 | Max frame gap | 1 | Consecutive missed frames tolerated before a track terminates. Missed frames are filled by linear interpolation (shown as open markers in exported plots). |
 | Max overlap discard (%) | 10 | If two fitted ellipses in the same frame overlap by more than this fraction of the smaller ellipse's area, the one with the higher track ID is discarded. |
 
@@ -174,12 +195,12 @@ The closest qualifying candidate is recorded as the mother. Results appear as an
 ### Manual measurement
 
 1. Open a TIF file with **Browse**.
-2. Set parameters and click **Adjust Settings**.
+2. Set parameters in the panel — they're picked up automatically when you next click Measure, no separate step needed.
 3. Navigate to any frame and **left-click** on each cell to place a seed (green cross).
 4. Click **Measure**. Each seed is tracked forward through the stack.
 5. Review results in the table and image.
 
-Seeds can be added or removed at any time. Clicking **Measure** always recomputes from scratch using the current seeds and settings.
+Seeds can be added or removed at any time. Clicking **Measure** always re-tracks every current seed from scratch using the current settings, but the **results table is not cleared** — the new rows are appended below whatever is already there (tagged with an incrementing **Run #**), so you can try different settings and compare runs side by side. Click **Clear Table** to drop the accumulated rows, or **Clear Selections** to also remove all seeds and start over.
 
 ### Auto-Detect & Measure
 
@@ -198,6 +219,16 @@ Seeds can be added or removed at any time. Clicking **Measure** always recompute
 
 Click **Stop** at any time to interrupt fitting. Results computed up to that point are kept.
 
+### Re-fitting a frame range
+
+If a specific stretch of a movie tracked badly, you don't need to re-measure the whole thing:
+
+1. Adjust whichever setting likely caused the problem — e.g. raise **Min edge contrast** if a bright artefact got picked up, increase **Max cell radius** if the cell drifted further than expected, or enable **BF background correction**.
+2. Set the **From** and **To** frame numbers next to **Re-fit frames** to the problematic range (1-based, inclusive).
+3. Click **Re-fit Frame Range**.
+
+Every track that was still alive just before **From** is continued from its last good position using the new settings; any seed you've placed manually inside the range starts a fresh track there. Every frame outside **[From, To]** is left completely untouched. The results are appended to the table as a new run, so you can compare the re-fit against the original.
+
 ---
 
 ## Results Table
@@ -206,6 +237,7 @@ Each row corresponds to one cell on one frame. Columns can be toggled via **Outp
 
 | Column | Unit | Description |
 |---|---|---|
+| Run # | — | Which measurement run this row came from (increments every time you click Measure / Auto-Detect & Measure / Re-fit Frame Range) |
 | Cell | — | Track ID (assigned in order of first detection) |
 | Mother Cell | — | Track ID of the mother cell, or `—` if no mother detected. Disabled by default. |
 | Frame | — | Zero-based frame index |
@@ -220,7 +252,14 @@ Each row corresponds to one cell on one frame. Columns can be toggled via **Outp
 | FL1 Mean | a.u. | Mean fluorescence intensity inside the ellipse (channel 1) |
 | FL2 Mean | a.u. | Mean fluorescence intensity inside the ellipse (channel 2) |
 
-**Clicking any row** jumps the image to that frame and highlights the cell in cyan.
+The table **accumulates** results rather than replacing them: every measurement run adds its rows below whatever is already there. Use the buttons below the table to manage it:
+
+| Button | Effect |
+|---|---|
+| Delete Selected Rows | Remove the currently selected row(s) from the table (and from anything exported afterwards) |
+| Clear Table | Empty the table without affecting seeds or tracking state |
+
+The table is also cleared automatically when you load a new file or click **Clear Selections**. **Click any row** to jump the image to that frame and highlight the cell in cyan.
 
 ---
 
@@ -236,11 +275,11 @@ Copies the table as tab-separated text, ready to paste into Excel or any spreads
 
 ### Export ROIs
 
-Saves all fitted ellipses as an ImageJ-compatible `.zip` ROI file. Open it in Fiji via the ROI Manager to overlay ellipses on the original images.
+Saves every ellipse currently shown in the results table as an ImageJ-compatible `.zip` ROI file (plus a point ROI for each unfitted seed). Open it in Fiji via the ROI Manager to overlay ellipses on the original images. Rows you've removed with **Delete Selected Rows** are excluded.
 
 ### Export Plots
 
-Generates one PNG per tracked cell, saved to a folder of your choice. Each figure contains:
+Generates one PNG per cell track currently shown in the results table, saved to a folder of your choice. Each figure contains:
 
 - **Left** — cropped brightfield snapshot at the cell's first detected frame, with the fitted ellipse in cyan and a physical scale bar.
 - **Right** — 2×2 time-series: X centroid, Y centroid, major semi-axis, and minor semi-axis vs. time (in seconds).
@@ -314,9 +353,16 @@ The script prints a per-track summary to the console and saves a CSV with one ro
 **Tracks terminate too early**
 - Increase **Max frame gap** to bridge more missed frames.
 - Loosen **Max size change (%)** if the cell grows or shrinks rapidly.
+- If the cell is budding/growing over a long movie, raise **Max growth per frame (%)** so the search radius keeps pace with the cell's size instead of staying capped at **Max cell radius**.
 
 **Pixel size or time step are wrong after loading**
-- Values are auto-read from TIF metadata (OME-XML, ImageJ tags, TIFF resolution). Override them manually in the settings panel and click **Adjust Settings**.
+- Values are auto-read from TIF metadata (OME-XML, ImageJ tags, TIFF resolution). Override them manually in the settings panel — they take effect the next time you click Measure, an Auto-Detect button, or Re-fit Frame Range.
+
+**The results table has duplicate-looking rows after measuring more than once**
+- This is expected: results accumulate across runs instead of being overwritten, so the **Run #** column lets you compare them. Click **Clear Table** (or **Clear Selections**) first if you only want the latest run.
+
+**Measure / Auto-Detect / Re-fit Frame Range buttons are greyed out**
+- A fitting run is already in progress. Wait for it to finish, or click **Stop** to interrupt it.
 
 ---
 
@@ -364,6 +410,7 @@ from pybud import export_cell_plots              # convenience shortcut
 | `bg_correction_sigma` | `float` | `0.0` | Gaussian sigma for BF background subtraction (µm; 0 = off) |
 | `max_gap` | `int` | `1` | Max consecutive missed frames before track termination |
 | `max_size_change` | `float` | `0.5` | Max fractional radius change per frame (0 = disabled) |
+| `max_growth_per_frame` | `float` | `0.05` | Fractional per-frame growth allowance used to widen the search radius beyond `cell_radius` as a cell grows (0 = disabled, fixed radius) |
 | `overlap_threshold` | `float` | `0.1` | Overlap fraction above which duplicate tracks are removed |
 | `bud_distance_factor` | `float` | `1.2` | Proximity multiplier for mother-daughter detection |
 | `bud_size_ratio` | `float` | `0.8` | Size ratio threshold for mother-daughter detection |
@@ -372,9 +419,11 @@ from pybud import export_cell_plots              # convenience shortcut
 | `n_cells_max` | `int` | `10` | Maximum Hough candidates per frame |
 | `hough_threshold` | `float` | `0.5` | Minimum Hough accumulator score (0–1) |
 | `match_distance_um` | `float` | `8.0` | Max inter-frame displacement to keep as same track (µm) |
-| `cells` | `list[Cell]` | `[]` | Results after `fit_cells()` |
+| `cells` | `list[Cell]` | `[]` | Results after `fit_cells()` / `refit_range()` |
 | `mother_ids` | `dict` | `{}` | `{child_track_id: mother_track_id}` (−1 = no mother) |
 | `selections` | `dict` | `{}` | `{frame: [(x, y), ...]}` seed points |
+| `lost_cells` | `list[tuple]` | `[]` | `[(cell_id, frame, reason), ...]` — tracks that were given up on, populated by `fit_cells()` / `refit_range()` |
+| `fl_channel_offsets` | `dict` | `{}` | `{fl_channel: (dx, dy)}` pixel offset applied when sampling that channel, correcting a fixed misalignment with the brightfield-fitted outline. Only affects cells fitted *after* it's set — see `estimate_fl_offset()`. |
 
 #### Methods
 
@@ -393,6 +442,18 @@ Remove the nearest seed to `(x, y)` on `frame` (within `selection_radius` pixels
 **`fit_cells(callback=None)`**
 
 Track all current seeds and populate `self.cells`. Runs fitting in parallel threads. After fitting, performs gap filling (linear interpolation), overlap filtering, and mother-daughter detection. The optional `callback(frame)` is called after each frame for progress reporting.
+
+**`refit_range(start_frame, end_frame, callback=None, cell_ids=None)`**
+
+Re-run tracking for frames `[start_frame, end_frame]` only (inclusive, 0-based), leaving every other frame's results in `self.cells` untouched. Existing tracks are continued from their last fitted position just before `start_frame`; any seed added inside the range starts a new track there. Pass `cell_ids` (an iterable of track IDs) to restrict the re-fit to just those cells, leaving every other cell's results in the range untouched too — omit it (or pass `None`) to re-fit every cell active in the range. Use this to fix a specific problematic stretch of a movie after tweaking settings, without re-measuring everything.
+
+**`estimate_fl_offset(fl_channel, search_radius_px=8, max_samples=80) → tuple or None`**
+
+Estimate a fixed pixel offset between the brightfield-fitted outlines and `fl_channel`, for correcting a chromatic/optical misalignment between channels (e.g. a second camera or filter cube). Tries every integer `(dx, dy)` shift within `search_radius_px` and picks the one that, averaged over a sample of already-fitted cells (capped at `max_samples`), best separates "inside the shifted outline" from "outside it" in that channel's signal. Requires `fit_cells()` / `refit_range()` to have produced some fitted cells first; returns `None` otherwise. Returns `(dx, dy, best_score, zero_score)` — the result is **not** applied automatically; set `fl_channel_offsets[fl_channel] = (dx, dy)` and re-run fitting for it to take effect.
+
+**`get_pending_ids()`**
+
+Return `{(frame, x, y): cell_id}` for every current seed, giving the track ID each seed will receive the next time `fit_cells()` runs (same numbering order: by frame, then insertion order). Mainly used by the GUI to label seed crosses before fitting.
 
 **`clear()`**
 
@@ -556,4 +617,24 @@ n = Plots.export_cell_plots(
     img=pb.img, bf_channel=pb.bf_channel, pixel_size=pb.pixel_size,
 )
 print(f"Saved {n} plot(s).")
+```
+
+### Example: correcting a shifted fluorescence channel
+
+```python
+from pybud import PyBud
+
+pb = PyBud().load("my_movie.tif")
+pb.bf_channel  = 0
+pb.fl_channels = [1]
+
+pb.add_selection(0, 150, 200)
+pb.fit_cells()   # need some fitted outlines before an offset can be estimated
+
+result = pb.estimate_fl_offset(fl_channel=1)
+if result is not None:
+    dx, dy, best_score, zero_score = result
+    print(f"Estimated offset: ({dx}, {dy}) px  (contrast {best_score:.1f} vs {zero_score:.1f} uncorrected)")
+    pb.fl_channel_offsets[1] = (dx, dy)
+    pb.fit_cells()   # re-run so the Fluorescence stats actually use the correction
 ```
