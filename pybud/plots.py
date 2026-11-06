@@ -29,10 +29,37 @@ class Plots:
     ...                         pixel_size=pb.pixel_size)
     """
 
+    # key -> (axis label, value getter). Order here is the order quantities
+    # appear in the UI and in a figure when multiple are selected.
+    _QUANTITY_GETTERS = {
+        "x":           ("X centroid (µm)",      lambda c: c.x_centroid),
+        "y":           ("Y centroid (µm)",      lambda c: c.y_centroid),
+        "major":       ("Major semi-axis (µm)", lambda c: c.major),
+        "minor":       ("Minor semi-axis (µm)", lambda c: c.minor),
+        "angle":       ("Angle (deg)",          lambda c: c.angle),
+        "edge_width":  ("Edge width (µm)",      lambda c: c.edge_width),
+        "volume":      ("Volume",               lambda c: c.volume),
+        "fl1_mean":    ("FL1 Mean",             lambda c: c.fluorescence[0].mean
+                                                           if len(c.fluorescence) > 0 else 0.0),
+        "fl1_mean_bg": ("FL1 BG-Sub Mean",      lambda c: c.fluorescence[0].mean_bg_subtracted
+                                                           if len(c.fluorescence) > 0 else 0.0),
+        "fl2_mean":    ("FL2 Mean",             lambda c: c.fluorescence[1].mean
+                                                           if len(c.fluorescence) > 1 else 0.0),
+        "fl2_mean_bg": ("FL2 BG-Sub Mean",      lambda c: c.fluorescence[1].mean_bg_subtracted
+                                                           if len(c.fluorescence) > 1 else 0.0),
+    }
+    DEFAULT_QUANTITIES = ["x", "y", "major", "minor"]
+
+    @staticmethod
+    def available_quantities():
+        """[(key, axis_label), ...] for every plottable quantity, in display order."""
+        return [(key, label) for key, (label, _) in Plots._QUANTITY_GETTERS.items()]
+
     @staticmethod
     def export_cell_plots(cells, time_step: float, time_unit: str, out_dir: str,
                           img=None, bf_channel: int = 0,
-                          pixel_size: float = 1.0) -> int:
+                          pixel_size: float = 1.0, quantities=None,
+                          filename_prefix: str = "cell") -> int:
         """
         Generate a figure for each cell track and save as PNG.
 
@@ -40,10 +67,10 @@ class Plots:
 
         * **Left** — cropped brightfield snapshot at the first detected frame,
           with the fitted ellipse overlaid in cyan and a scale bar.
-        * **Right** — 2×2 time-series panels (X centroid, Y centroid,
-          Major semi-axis, Minor semi-axis).
+        * **Right** — one time-series panel per entry in *quantities*, in a
+          grid up to 2 columns wide.
 
-        Without *img* a plain 2×2 grid is used.
+        Without *img* the same panels fill a plain grid.
 
         Parameters
         ----------
@@ -61,12 +88,19 @@ class Plots:
             Channel index of the brightfield channel in *img*.
         pixel_size : float
             µm per pixel, used for the scale bar.
+        quantities : list of str, optional
+            Keys from :meth:`available_quantities` selecting which panels to
+            plot and in what order. Defaults to :attr:`DEFAULT_QUANTITIES`
+            (X/Y centroid, major/minor axis — the original fixed 2×2 layout).
+        filename_prefix : str
+            Each file is saved as ``"{filename_prefix}_{cell_id}.png"``.
 
         Returns
         -------
         int
             Number of PNG files saved.
         """
+        import math
         import matplotlib.pyplot as plt
         from matplotlib.gridspec import GridSpec
         plt.switch_backend("Agg")
@@ -75,6 +109,11 @@ class Plots:
         tracks = defaultdict(list)
         for cell in cells:
             tracks[cell.id].append(cell)
+
+        quantities = list(quantities) if quantities else list(Plots.DEFAULT_QUANTITIES)
+        n_panels = len(quantities)
+        ncols = 2 if n_panels > 1 else 1
+        nrows = max(1, math.ceil(n_panels / ncols))
 
         use_time = (time_step != 1.0)
         x_label  = f"Time ({time_unit})" if use_time else "Frame"
@@ -88,24 +127,24 @@ class Plots:
             interp = np.array([getattr(c, "interpolated", False) for c in track_cells])
 
             panels = [
-                ("X centroid (µm)",      np.array([c.x_centroid for c in track_cells])),
-                ("Y centroid (µm)",      np.array([c.y_centroid for c in track_cells])),
-                ("Major semi-axis (µm)", np.array([c.major      for c in track_cells])),
-                ("Minor semi-axis (µm)", np.array([c.minor      for c in track_cells])),
+                (Plots._QUANTITY_GETTERS[q][0],
+                 np.array([Plots._QUANTITY_GETTERS[q][1](c) for c in track_cells]))
+                for q in quantities
             ]
 
             show_img = img is not None
             if show_img:
-                fig = plt.figure(figsize=(14, 6))
+                fig = plt.figure(figsize=(7 + 3.5 * ncols, max(6, 3.2 * nrows)))
                 gs  = GridSpec(1, 2, figure=fig,
-                               width_ratios=[1, 2.2], wspace=0.3)
+                               width_ratios=[1, 1.1 * ncols], wspace=0.3)
                 ax_img  = fig.add_subplot(gs[0, 0])
-                gs_plot = gs[0, 1].subgridspec(2, 2, hspace=0.55, wspace=0.45)
+                gs_plot = gs[0, 1].subgridspec(nrows, ncols, hspace=0.55, wspace=0.45)
                 plot_axes = [fig.add_subplot(gs_plot[i, j])
-                             for i in range(2) for j in range(2)]
+                             for i in range(nrows) for j in range(ncols)][:n_panels]
             else:
-                fig, plot_axes_arr = plt.subplots(2, 2, figsize=(10, 7))
-                plot_axes = list(plot_axes_arr.flat)
+                fig, plot_axes_arr = plt.subplots(nrows, ncols,
+                                                   figsize=(5 * ncols, 3.2 * nrows), squeeze=False)
+                plot_axes = list(plot_axes_arr.flat)[:n_panels]
 
             fig.suptitle(f"Cell {tid}", fontsize=13)
 
@@ -122,7 +161,7 @@ class Plots:
                 ax.grid(True, alpha=0.3)
                 ax.tick_params(labelsize=8)
 
-            if interp.any():
+            if interp.any() and plot_axes:
                 plot_axes[0].legend(fontsize=8)
 
             if show_img:
@@ -132,7 +171,7 @@ class Plots:
                     ax_img.set_title("(image unavailable)", fontsize=8)
                     ax_img.axis("off")
 
-            fig.savefig(os.path.join(out_dir, f"cell_{tid}.png"),
+            fig.savefig(os.path.join(out_dir, f"{filename_prefix}_{tid}.png"),
                         dpi=150, bbox_inches="tight")
             plt.close(fig)
             saved += 1

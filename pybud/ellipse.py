@@ -1,6 +1,5 @@
 import numpy as np
 from scipy.optimize import least_squares
-from numpy.linalg import eig, inv
 
 class Ellipse:
     def __init__(self, x, y, method='algebraic'):

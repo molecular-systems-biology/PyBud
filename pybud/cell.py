@@ -16,7 +16,10 @@ class Cell:
                  edge_size = 15,
                  edge_rel_min = 30,
                  fitting_method='algebraic',
-                 min_cell_radius_px = 0,
+                 min_valid_points = 150,
+                 rescue_missing_angles = False,
+                 rescue_margin_px = None,
+                 rescue_min_provisional_points = 30,
                  fl_channel_offsets = None,
                  ):
 
@@ -32,7 +35,16 @@ class Cell:
         self.edge_size = edge_size
         self.edge_rel_min = edge_rel_min
         self.fitting_method = fitting_method
-        self.min_cell_radius_px = min_cell_radius_px
+        self.min_valid_points = min_valid_points
+        # Opt-in: use a provisional ellipse fit on the main scan's points to
+        # predict where the edge should be for angles that found nothing (or
+        # got filtered out), then give just those angles one more, narrow,
+        # targeted look -- see _rescue_missing_angles() below. Strictly
+        # additive: only ever ADDS points for angles that had none;
+        # already-accepted points are never touched or replaced.
+        self.rescue_missing_angles = rescue_missing_angles
+        self.rescue_margin_px = rescue_margin_px
+        self.rescue_min_provisional_points = rescue_min_provisional_points
         # {fl_channel: (dx, dy)} pixel offset correcting for a fixed chromatic/
         # optical misalignment between that channel and the brightfield-fitted
         # outline — see PyBud.estimate_fl_offset(). Missing entries mean (0, 0).
@@ -49,6 +61,40 @@ class Cell:
     def get_cell_data(self):
 
         self.get_cell_edge()
+
+        if self.rescue_missing_angles and np.sum(self.pixel_found) >= self.rescue_min_provisional_points:
+            # A provisional fit, even if too sparse/incomplete to accept yet,
+            # is already a far better per-angle radius estimate than the
+            # single blind cell_radius guess every angle had to search within
+            # on the main scan -- use it to rescue angles that found nothing.
+            try:
+                provisional = Ellipse(self.found_x[self.pixel_found], self.found_y[self.pixel_found],
+                                       method=self.fitting_method)
+            except Exception:
+                provisional = None
+            if provisional is not None:
+                self.ellipse = provisional
+                # Snapshot pre-rescue state so a rescue that pulls the final
+                # fit too far off course can be reverted rather than accepted
+                # unconditionally -- see _rescue_fit_is_plausible below.
+                backup = (self.pixel_found.copy(), self.found_x.copy(), self.found_y.copy(),
+                          self.found_rad.copy(), self.found_edge.copy())
+                if self._rescue_missing_angles():
+                    self._finalize_cell_found()  # re-check threshold/border with the enlarged point set
+                    if self.cell_found:
+                        try:
+                            post_rescue = Ellipse(self.found_x[self.pixel_found], self.found_y[self.pixel_found],
+                                                   method=self.fitting_method)
+                        except Exception:
+                            post_rescue = None
+                        if post_rescue is None or not self._rescue_fit_is_plausible(provisional, post_rescue):
+                            # Revert to pre-rescue state. May still end up
+                            # found (if it already was before rescue) or not
+                            # (rescue was this cell's only chance) --
+                            # re-finalize against the restored point set.
+                            (self.pixel_found, self.found_x, self.found_y,
+                             self.found_rad, self.found_edge) = backup
+                            self._finalize_cell_found()
 
         if not self.cell_found:
             print(f"cell not found on frame {self.frame} x {self.x_selected} y {self.y_selected}")
@@ -136,6 +182,21 @@ class Cell:
         R = self.cell_radius
         W = self.edge_size
 
+        if R < W:
+            # The sliding window can't fit in a profile this short (e.g. a
+            # tracking search radius set smaller than the edge window) --
+            # report "no edge found" for every angle instead of letting
+            # sliding_window_view raise.
+            self.pixel_found      = np.zeros(360, dtype=bool)
+            self.found_x          = np.zeros(360, dtype=np.float64)
+            self.found_y          = np.zeros(360, dtype=np.float64)
+            self.found_rad        = np.zeros(360, dtype=np.float64)
+            self.found_dif        = np.zeros(360, dtype=np.float64)
+            self.found_edge       = np.zeros(360, dtype=np.float64)
+            self.found_slope      = np.zeros(360, dtype=np.float64)
+            self.pixel_val_rel_dif = np.zeros(360, dtype=np.float64)
+            return
+
         # ── Build all 360 radial profiles at once ─────────────────────────
         # angles: (360,)   radii: (R+1,)
         angles = np.arange(360, dtype=np.float64) * (np.pi / 180.0)
@@ -147,6 +208,14 @@ class Cell:
         xs   = np.round(xs_f).astype(np.int32)   # unclipped — kept for found_x/y
         ys   = np.round(ys_f).astype(np.int32)
 
+        # Nearest-neighbor sampling, matching BudJ (CellBJ.java rounds to the
+        # nearest pixel then does a direct getPixel() lookup — no
+        # interpolation). Bilinear interpolation was tried and measured
+        # *worse* on 257 real cells (65.4% vs 71.6% of cells well-tracked,
+        # same ballpark volume accuracy either way) — softening the sharp
+        # dark->bright transition at a real edge lowers its apparent
+        # contrast just enough to drop some borderline-but-real edges below
+        # edge_rel_min. See benchmark_alitsios/benchmark/README.md.
         in_bounds = ((xs >= 0) & (xs < self.img_width) &
                      (ys >= 0) & (ys < self.img_height))
         xs_c = np.clip(xs, 0, self.img_width  - 1)
@@ -191,12 +260,6 @@ class Cell:
         dx                     = self.found_x - self.x_selected
         dy                     = self.found_y - self.y_selected
         self.found_rad         = np.where(any_valid, np.sqrt(dx*dx + dy*dy), 0.0)
-
-        # Reject edges closer to the seed than the minimum expected cell radius.
-        # This prevents strong interior gradients (bud necks, DIC phase artefacts)
-        # from producing false near-centre edge detections that bias the ellipse fit.
-        if self.min_cell_radius_px > 0:
-            self.pixel_found &= (self.found_rad >= self.min_cell_radius_px)
 
         self.found_dif         = np.where(any_valid, masked_dif[a_all, best_n], 0.0)
         edge_w                 = np.where(any_valid, (pm - pn).astype(np.float64), 0.0)
@@ -264,9 +327,9 @@ class Cell:
                 vector_angle += 1
 
     def _finalize_cell_found(self):
-        """Require >= 180 valid edges, confirm they're within image bounds, and
-        compute the mean edge width if the cell is accepted."""
-        self.cell_found = np.sum(self.pixel_found) >= 180
+        """Require >= min_valid_points valid edges, confirm they're within
+        image bounds, and compute the mean edge width if the cell is accepted."""
+        self.cell_found = np.sum(self.pixel_found) >= self.min_valid_points
 
         if self.cell_found:
             x_valid = (self.found_x[self.pixel_found] >= 2) & (self.found_x[self.pixel_found] <= self.img_width - 2)
@@ -275,6 +338,189 @@ class Cell:
 
         if self.cell_found:
             self.mean_edge = np.mean(self.found_edge[self.pixel_found])
+
+    # ------------------------------------------------------------------
+    # Opt-in missing-angle rescue (self.rescue_missing_angles)
+    # ------------------------------------------------------------------
+    #
+    # The main scan searches every angle blind over [0, cell_radius] --
+    # cell_radius is just a configured upper bound, not a per-angle
+    # estimate of where the edge actually is. Once a (possibly provisional,
+    # possibly already-accepted) ellipse fit exists, it's a far better
+    # per-angle radius estimate than that single shared guess. For any
+    # angle that found nothing in the main scan (no window cleared
+    # edge_rel_min) or got filtered out by the outlier/difference/slope/jump
+    # filters, this uses the fit to predict where the edge should be for
+    # that specific angle and gives it one more, much narrower, targeted
+    # look. Strictly additive: an angle that already has an accepted point
+    # is never touched or re-searched.
+
+    def _predict_radius_along_seed_rays(self, ellipse, angles_rad):
+        """
+        For each angle (as a ray from the seed point x_selected,y_selected,
+        matching the main scan's own parametrization), the radius at which
+        that ray crosses `ellipse`'s boundary -- found analytically by
+        substituting the ray into the ellipse's implicit equation and
+        solving the resulting quadratic for every angle at once. NaN where
+        the ray doesn't hit the ellipse going outward (degenerate case: the
+        seed point ended up outside the ellipse).
+        """
+        a, b = ellipse.get_major(), ellipse.get_minor()
+        xc, yc = ellipse.get_x_center(), ellipse.get_y_center()
+        phi = np.radians(ellipse.get_angle())
+        cphi, sphi = np.cos(phi), np.sin(phi)
+
+        # seed point in the ellipse's canonical (centered, unrotated) frame
+        dx0, dy0 = self.x_selected - xc, self.y_selected - yc
+        x0 = dx0 * cphi + dy0 * sphi
+        y0 = -dx0 * sphi + dy0 * cphi
+
+        # ray direction in the same canonical frame
+        dx, dy = np.cos(angles_rad), np.sin(angles_rad)
+        ddx = dx * cphi + dy * sphi
+        ddy = -dx * sphi + dy * cphi
+
+        A = (ddx / a) ** 2 + (ddy / b) ** 2
+        B = 2.0 * (x0 * ddx / a ** 2 + y0 * ddy / b ** 2)
+        C = (x0 / a) ** 2 + (y0 / b) ** 2 - 1.0
+
+        disc = B ** 2 - 4 * A * C
+        valid = disc >= 0
+        sqrt_disc = np.sqrt(np.clip(disc, 0, None))
+        safe_A = np.where(A != 0, A, 1.0)
+        t1 = (-B - sqrt_disc) / (2 * safe_A)
+        t2 = (-B + sqrt_disc) / (2 * safe_A)
+        eps = 1e-6
+        # smallest positive root = first crossing moving outward from the seed
+        t = np.where(t1 > eps, t1, np.where(t2 > eps, t2, np.nan))
+        return np.where(valid & (A != 0), t, np.nan)
+
+    def _rescan_near_radius(self, angles_rad, r_center, margin_px, window):
+        """
+        Like the main scan, but searching only a narrow window of radii
+        around r_center[i] (one centre per angle) instead of the shared
+        [0, cell_radius] range. Same windowed dark->bright detection,
+        nearest-neighbor pixel sampling (bilinear interpolation was tried
+        for the main scan too and measured worse -- see README.md).
+        Returns (found, edge_x, edge_y, edge_width), one entry per input angle.
+        """
+        from numpy.lib.stride_tricks import sliding_window_view
+
+        n = len(angles_rad)
+        offsets = np.arange(-margin_px, margin_px + 1, dtype=np.float64)
+        M = len(offsets)
+        if n == 0 or M < window:
+            return (np.zeros(n, dtype=bool), np.zeros(n), np.zeros(n), np.zeros(n))
+
+        selected_image = self.img[self.frame, self.bf_channel, :, :]
+        radii = np.clip(r_center[:, None] + offsets[None, :], 0, None)   # (n, M)
+        xs_f = self.x_selected + np.cos(angles_rad)[:, None] * radii
+        ys_f = self.y_selected + np.sin(angles_rad)[:, None] * radii
+        xs = np.round(xs_f).astype(np.int32)
+        ys = np.round(ys_f).astype(np.int32)
+
+        in_bounds = ((xs >= 0) & (xs < self.img_width) &
+                     (ys >= 0) & (ys < self.img_height))
+        xs_c = np.clip(xs, 0, self.img_width - 1)
+        ys_c = np.clip(ys, 0, self.img_height - 1)
+        profiles = selected_image[ys_c, xs_c].astype(np.float64)
+        profiles[~in_bounds] = self.background
+
+        windows = sliding_window_view(profiles, window_shape=window, axis=1)
+        pos_max = np.argmax(windows, axis=2)
+        pos_min = np.argmin(windows, axis=2)
+        idx = np.arange(n)[:, None]
+        n_idx = np.arange(M - window + 1)[None, :]
+        val_max = windows[idx, n_idx, pos_max]
+        val_min = windows[idx, n_idx, pos_min]
+        dif = val_max - val_min
+        rel_dif = 100.0 * dif / self.background
+        valid = (pos_max > pos_min) & (rel_dif > self.edge_rel_min)
+        masked_dif = np.where(valid, dif, 0.0)
+
+        best_n = np.argmax(masked_dif, axis=1)
+        found = np.any(valid, axis=1)
+        all_idx = np.arange(n)
+        pm = pos_max[all_idx, best_n]
+        pn = pos_min[all_idx, best_n]
+        lp = best_n + (pm + pn) // 2
+
+        edge_x = np.where(found, xs[all_idx, lp].astype(np.float64), 0.0)
+        edge_y = np.where(found, ys[all_idx, lp].astype(np.float64), 0.0)
+        edge_w = np.where(found, (pm - pn).astype(np.float64), 0.0)
+        return found, edge_x, edge_y, edge_w
+
+    def _rescue_missing_angles(self):
+        """
+        Fill in angles with no accepted point using self.ellipse (a
+        provisional or already-accepted fit) as a radius prior. Mutates
+        pixel_found/found_x/found_y/found_rad/found_edge in place for
+        rescued angles only. Returns True if anything was rescued (caller
+        should re-run _finalize_cell_found to pick up the enlarged set),
+        False otherwise.
+        """
+        missing = ~self.pixel_found
+        n_missing = int(np.sum(missing))
+        if n_missing == 0:
+            return False
+
+        missing_idx_all = np.nonzero(missing)[0]
+        angles_rad = missing_idx_all.astype(np.float64) * (np.pi / 180.0)
+        r_pred = self._predict_radius_along_seed_rays(self.ellipse, angles_rad)
+        has_pred = ~np.isnan(r_pred)
+        if not np.any(has_pred):
+            return False
+
+        # Default margin: tighter than edge_size (tried first, see README.md)
+        # -- a few slide positions around the predicted radius rather than a
+        # window as wide as the whole edge-detection scan. (edge_size // 2) +
+        # 2 keeps 2*margin+1 comfortably above edge_size (so the sliding
+        # window still fits) while roughly halving the search range.
+        margin = (self.rescue_margin_px if self.rescue_margin_px is not None
+                  else max(3, (self.edge_size // 2) + 2))
+        target_idx = missing_idx_all[has_pred]
+        found, ex, ey, ew = self._rescan_near_radius(
+            angles_rad[has_pred], r_pred[has_pred], margin, self.edge_size)
+        if not np.any(found):
+            return False
+
+        rescued = target_idx[found]
+        ex_f, ey_f, ew_f = ex[found], ey[found], ew[found]
+        if len(rescued) == 0:
+            return False
+
+        self.found_x[rescued] = ex_f
+        self.found_y[rescued] = ey_f
+        dxr = ex_f - self.x_selected
+        dyr = ey_f - self.y_selected
+        self.found_rad[rescued] = np.hypot(dxr, dyr)
+        self.found_edge[rescued] = ew_f
+        self.pixel_found[rescued] = True
+        return True
+
+    def _rescue_fit_is_plausible(self, before, after):
+        """
+        Sanity check comparing the post-rescue refit against the
+        pre-rescue (provisional) fit, for the same reason max_size_change
+        exists at the tracking level: rescued points are, by construction,
+        from the "hard" angles the main scan couldn't resolve on its own,
+        so blindly trusting whatever they pull the fit toward is exactly
+        the kind of self-referential-update risk that caused the
+        max_growth_per_frame bug. Same bound as the removed
+        outline-refinement feature used.
+        """
+        dx = after.get_x_center() - before.get_x_center()
+        dy = after.get_y_center() - before.get_y_center()
+        shift = np.hypot(dx, dy)
+        orig_major = before.get_major()
+        new_major = after.get_major()
+        if orig_major <= 0 or new_major <= 0:
+            return False
+        if shift > 0.5 * orig_major:
+            return False
+        if new_major > 2.0 * orig_major or new_major < 0.5 * orig_major:
+            return False
+        return True
 
     def __str__(self):
         return f"Cell ID: {self.id}, Pos: ({self.x_selected:.2f}, {self.y_selected:.2f}), Centroid: ({self.x_centroid:.2f}, {self.y_centroid:.2f}), Major: {self.major:.2f} µm, Minor: {self.minor:.2f} µm, Angle: {self.angle:.2f}°, Edge Width: {self.edge_width:.2f} µm"

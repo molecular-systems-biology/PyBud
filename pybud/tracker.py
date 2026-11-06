@@ -155,6 +155,14 @@ class PyBud:
         # fitted cells only (existing Cell objects already baked theirs in).
         self.fl_channel_offsets = {}
         self.cell_radius  = 4        # µm — max radial search distance from seed
+        # Per-frame tracking search radius, independent of cell_radius -- 0
+        # (the default) means "use cell_radius". A smaller explicit value
+        # tightens the search window around the previous frame's position,
+        # which can reduce false-positive edges from neighbouring cells or
+        # debris in a cluttered image, at the cost of capping how far a cell
+        # can drift/grow in one frame (the radial profile can't find an edge
+        # past whatever radius it's given).
+        self.tracking_search_radius = 0.0  # µm; 0 = use cell_radius
         self.edge_size    = 1        # µm — edge-detection sliding-window width
         self.edge_rel_min = 30       # %  — minimum relative edge contrast
         self.time_step    = 1.0      # seconds per frame
@@ -171,8 +179,93 @@ class PyBud:
         # *after* a fit, it doesn't widen the search before one. Each frame's
         # effective search radius is max(cell_radius, last_known_major *
         # (1 + max_growth_per_frame) ** frames_since_last_fit) — compounding
-        # across any gap frames. 0 = disabled (fixed cell_radius, old behaviour).
-        self.max_growth_per_frame = 0.05
+        # across any gap frames. 0 = disabled (fixed cell_radius, matching
+        # how the original (Java) BudJ tracks — it has no equivalent of this
+        # expansion and uses a fixed search radius every frame throughout).
+        #
+        # Default is 0 (disabled). It was 0.05 until a benchmark against real
+        # budding-yeast movies (benchmark_alitsios/benchmark/README.md) found
+        # this was a real bug, not just a tuning issue: because each frame's
+        # cap is derived from the *previous* frame's own fit rather than any
+        # fixed reference, a handful of frames that are each only slightly
+        # too large (e.g. a budding neck pulling the fit a little wide)
+        # compounds into unbounded runaway growth with nothing to stop it —
+        # observed as a fitted "cell" ballooning ~9x past its true size over
+        # 25 frames. Capping the expansion relative to the track's own
+        # starting size (max_search_radius_factor, below) was tried first
+        # and measured to make no difference in practice across 257 real
+        # cells (mean overestimate unchanged at 1.4x BudJ, same fraction of
+        # cells blowing up >3x) — a session's worth of frames already
+        # slightly too large settles into a stable *wrong* boundary well
+        # within any reasonably generous cap, so the cap doesn't prevent the
+        # failure, only bounds how far it runs. Disabling it outright matches
+        # BudJ's own (fixed-radius, and apparently sufficient even for
+        # actively budding cells) behaviour and measured a mean ratio of
+        # 0.93x BudJ's volume with 0% of cells over 1.5x, vs 1.43x mean /
+        # 18% over 1.5x with this enabled — at a small cost (~3 percentage
+        # points fewer cells tracked to completion on the same benchmark).
+        # Re-enable explicitly if you need to track growth over a much
+        # longer window than BudJ's workflow was ever designed for (BudJ's
+        # own interactive use leans on periodic manual re-clicks for that,
+        # rather than solving it algorithmically).
+        self.max_growth_per_frame = 0.0
+        # Ceiling on the above, as a multiple of the track's own starting
+        # size, *if* max_growth_per_frame is re-enabled above. Bounds how
+        # far a track can run away, but does not prevent the failure mode
+        # described above on its own -- see that comment.
+        self.max_search_radius_factor = 2.5
+
+        # (A near-centre edge-radius filter -- intended to reject bud necks/
+        # DIC phase artefacts -- was removed entirely here: BudJ's GetCellEdge
+        # has no equivalent (verified against CellBJ.java), and disabling it
+        # had already been shown to *improve* completeness with no accuracy
+        # cost before removal. See benchmark_alitsios/benchmark/README.md.)
+
+        # Minimum number of accepted edge points (out of 360) required to
+        # call a cell found. Was hardcoded to 180 with no comment explaining
+        # the choice; BudJ's equivalent threshold (verified against
+        # BudJ_Original_Batch/src/budjorig/CellBJ.java: `if (PixelFoundCtr <
+        # 150) SliceCellFound = false`) is 150, not 180 -- PyBud was
+        # stricter than BudJ for no stated reason. This was the single
+        # biggest contributor found to PyBud trailing BudJ on completeness:
+        # matching BudJ's 150 took PyBud from 48.6% to 71.6% of 257 real
+        # cells well-tracked (BudJ: 56.8%) with volume accuracy unchanged
+        # (median ratio to BudJ's own volume: 0.98 either way). See
+        # benchmark_alitsios/benchmark/README.md.
+        self.min_valid_points = 150
+
+        # (A single-pass outline-refinement feature -- uniform-arc-length
+        # resampling of the fitted ellipse + edge re-detection along the true
+        # local normal -- was tried and removed here: validated against BudJ
+        # on 257 real cells as a net regression, not an improvement. See
+        # benchmark_alitsios/benchmark/README.md for the full data.)
+
+        # Opt-in missing-angle rescue -- see Cell._rescue_missing_angles for the
+        # full explanation (use a provisional/accepted ellipse fit to predict
+        # where the edge should be for angles the main scan found nothing for,
+        # and give just those angles one narrow, targeted look -- strictly
+        # additive, never touches an already-accepted point).
+        #
+        # Validated on 257 real cells: a clear win, but kept OFF by default
+        # by choice (not because the data argues against it) -- enable it
+        # explicitly if your use case wants more coverage. Well-tracked
+        # 71.6% -> 86.4%, consistent across all 4 movies individually, with
+        # volume accuracy essentially unaffected once two refinements were
+        # made (both benchmarked, see README.md): (1) rescue_margin_px
+        # tightened from edge_size down to ~edge_size/2 -- a first, looser
+        # version got the same completeness gain but dragged median volume
+        # ratio to BudJ from 0.98 up to 1.15 (mean 1.21, 6% of cells over
+        # 1.5x); (2) a sanity check (_rescue_fit_is_plausible, same bound
+        # the removed outline-refinement feature used) that reverts a
+        # rescue whose resulting fit moved implausibly far from the
+        # pre-rescue estimate -- rescued points are, by construction, from
+        # the angles the main scan couldn't resolve on its own, so this
+        # guards against unconditionally trusting whatever they pull the
+        # fit toward. With both: median ratio 1.00, mean 0.97, only 1% of
+        # cells over 1.5x (down from 6%).
+        self.rescue_missing_angles = False
+        self.rescue_margin_px = None            # None = derive from edge_size (~half it)
+        self.rescue_min_provisional_points = 30  # min points to attempt a provisional fit at all
 
         # Background correction applied to the BF channel before edge detection
         self.bg_correction_sigma = 0.0  # Gaussian sigma in µm; 0 = disabled
@@ -336,7 +429,7 @@ class PyBud:
     # Tracking pipeline
     # ------------------------------------------------------------------
 
-    def fit_cells(self, callback=None):
+    def fit_cells(self, callback=None, progress_callback=None):
         """
         Track every seed forward through :attr:`img` and populate :attr:`cells`.
 
@@ -354,6 +447,12 @@ class PyBud:
         callback : callable(int), optional
             Called with the current frame index after each frame is processed.
             Intended for progress-bar updates from a GUI thread.
+        progress_callback : callable(int, int), optional
+            Called as ``(frames_done, frames_total)`` after every frame
+            attempted across *all* seeds combined -- unlike ``callback``
+            (which fires once per seed per frame, up to one per seed in
+            parallel), this is a single running count meant for an overall
+            progress bar when many seeds are tracking at once.
         """
         self.cells.clear()
         self.processed_cells.clear()
@@ -363,9 +462,9 @@ class PyBud:
             cid: (start_frame, float(x), float(y), None)   # no known size yet for a fresh seed
             for (start_frame, x, y), cid in self.get_pending_ids().items()
         }
-        self._run_tracking(seeds, callback)
+        self._run_tracking(seeds, callback, progress_callback=progress_callback)
 
-    def refit_range(self, start_frame, end_frame, callback=None, cell_ids=None):
+    def refit_range(self, start_frame, end_frame, callback=None, cell_ids=None, progress_callback=None):
         """
         Re-run tracking for frames ``[start_frame, end_frame]`` only
         (inclusive, 0-based), leaving every other frame's results untouched.
@@ -387,6 +486,9 @@ class PyBud:
             results inside the window are left exactly as they were, even
             if the new settings would have changed how it fits. Omit (or
             ``None``) to re-fit every cell active in the window, as before.
+        progress_callback : callable(int, int), optional
+            Called as ``(frames_done, frames_total)`` after every frame
+            attempted across all seeds in the range -- see :meth:`fit_cells`.
         """
         if self.img is None:
             return
@@ -403,7 +505,7 @@ class PyBud:
             return
 
         self._clear_frame_range(start_frame, end_frame, cell_ids)
-        self._run_tracking(seeds, callback, end_frame=end_frame)
+        self._run_tracking(seeds, callback, end_frame=end_frame, progress_callback=progress_callback)
 
     def _collect_refit_seeds(self, start_frame, end_frame, cell_ids=None):
         """
@@ -453,7 +555,7 @@ class PyBud:
         self.lost_cells = [lc for lc in self.lost_cells
                            if not (start_frame <= lc[1] <= end_frame and in_scope(lc[0]))]
 
-    def _run_tracking(self, seeds, callback, end_frame=None):
+    def _run_tracking(self, seeds, callback, end_frame=None, progress_callback=None):
         """
         Shared pipeline for :meth:`fit_cells` and :meth:`refit_range`: track
         every seed in parallel, then gap-fill, overlap-filter, and re-detect
@@ -464,9 +566,26 @@ class PyBud:
                           if self.bg_correction_sigma > 0
                           else self.img)
 
+        # Upper-bound estimate of total frame-attempts across every seed, for
+        # progress_callback -- an early-abandoned track (lost, or Stop
+        # pressed) means the real count can fall a little short of this, but
+        # the GUI side treats "finished" as 100% regardless, so that's fine.
+        last_frame_bound = (self._work_img.shape[0] - 1 if end_frame is None
+                            else min(end_frame, self._work_img.shape[0] - 1))
+        total_units = sum(max(0, last_frame_bound - sf + 1) for sf, _x, _y, _sm in seeds.values())
+        done_units = [0]
+
+        def bump_progress():
+            if progress_callback is None:
+                return
+            with self._lock:
+                done_units[0] += 1
+                n = done_units[0]
+            progress_callback(n, total_units)
+
         with ThreadPoolExecutor() as executor:
             futures = [
-                executor.submit(self._track_cell, cid, sf, x, y, callback, end_frame, seed_major)
+                executor.submit(self._track_cell, cid, sf, x, y, callback, end_frame, seed_major, bump_progress)
                 for cid, (sf, x, y, seed_major) in seeds.items()
             ]
             for future in as_completed(futures):
@@ -481,18 +600,30 @@ class PyBud:
         self._filter_overlapping()
         self._detect_mother_daughter()
 
-    def _track_cell(self, cell_id, start_frame, x, y, callback, end_frame=None, seed_major=None):
+    def _track_cell(self, cell_id, start_frame, x, y, callback, end_frame=None, seed_major=None,
+                     progress_bump=None):
         """
         Propagate a single cell seed forward through frames
         ``[start_frame, end_frame]``. ``seed_major`` is the cell's already-known
         size (pixels) when continuing an existing track — e.g. from
         :meth:`refit_range` — so the very first frame of the run also benefits
-        from growth-aware radius expansion, not just frames 2+.
+        from growth-aware radius expansion, not just frames 2+. ``progress_bump``,
+        if given, is called with no arguments once per frame attempted here
+        (found, not found, or cached) -- see :meth:`_run_tracking`.
         """
         consecutive_misses = 0
         prev_major = None          # drives the max_size_change rejection check, below
         prev_minor = None
         last_known_major = seed_major   # drives growth-aware search-radius expansion only
+        # Anchor for max_search_radius_factor: this track's own first measured
+        # size, fixed once known. Capping relative to base_radius_px (the
+        # configured search window, deliberately larger than the true cell so
+        # the radial scan has room to find the real edge) was too loose to
+        # block runaway growth in practice -- the window stayed within that
+        # cap long after the fit itself had inflated several-fold past the
+        # cell's actual size. Capping relative to the cell's own starting
+        # size directly bounds how much a track is allowed to appear to grow.
+        initial_major_px = seed_major
 
         last_frame = (self._work_img.shape[0] - 1 if end_frame is None
                       else min(end_frame, self._work_img.shape[0] - 1))
@@ -500,6 +631,9 @@ class PyBud:
         for frame in range(start_frame, last_frame + 1):
             if not self._should_run:
                 return
+
+            if progress_bump is not None:
+                progress_bump()
 
             key = (frame, x, y)
 
@@ -519,11 +653,14 @@ class PyBud:
                 prev_major = cached.ellipse.get_major()
                 prev_minor = cached.ellipse.get_minor()
                 last_known_major = prev_major
+                if initial_major_px is None:
+                    initial_major_px = prev_major
                 if callback is not None:
                     callback(frame)
                 continue
 
-            base_radius_px = int(np.ceil(self.cell_radius / self.pixel_size))
+            search_radius_um = self.tracking_search_radius if self.tracking_search_radius > 0 else self.cell_radius
+            base_radius_px = int(np.ceil(search_radius_um / self.pixel_size))
             edge_size_px = int(np.ceil(self.edge_size / self.pixel_size))
             if last_known_major is not None and self.max_growth_per_frame > 0:
                 # Compound over any missed frames since the last successful fit,
@@ -537,7 +674,9 @@ class PyBud:
                 # same margin forward or the window stays one step too tight.
                 growth = (1 + self.max_growth_per_frame) ** (consecutive_misses + 1)
                 projected_px = int(np.ceil(last_known_major * growth)) + edge_size_px
-                search_radius_px = max(base_radius_px, projected_px)
+                anchor = initial_major_px if initial_major_px is not None else last_known_major
+                max_projected_px = int(np.ceil(anchor * self.max_search_radius_factor)) + edge_size_px
+                search_radius_px = max(base_radius_px, min(projected_px, max_projected_px))
             else:
                 search_radius_px = base_radius_px
 
@@ -548,8 +687,10 @@ class PyBud:
                 edge_size_px,
                 self.edge_rel_min,
                 fitting_method=self.fitting_method,
-                # Reject near-centre edges (bud necks, DIC artefacts) matching BudJ behaviour
-                min_cell_radius_px=max(1, edge_size_px // 3),
+                min_valid_points=self.min_valid_points,
+                rescue_missing_angles=self.rescue_missing_angles,
+                rescue_margin_px=self.rescue_margin_px,
+                rescue_min_provisional_points=self.rescue_min_provisional_points,
                 fl_channel_offsets=self.fl_channel_offsets,
             )
 
@@ -581,8 +722,8 @@ class PyBud:
                     if major_chg > self.max_size_change or minor_chg > self.max_size_change:
                         frame_ok      = False
                         reject_reason = (f"size jump: major "
-                                         f"{prev_major * self.pixel_size:.2f}→"
-                                         f"{new_major  * self.pixel_size:.2f} µm")
+                                         f"{prev_major * self.pixel_size:.2f}->"
+                                         f"{new_major  * self.pixel_size:.2f} um")
 
             if frame_ok:
                 consecutive_misses = 0
@@ -593,8 +734,8 @@ class PyBud:
                 prev_major = cell.ellipse.get_major()
                 prev_minor = cell.ellipse.get_minor()
                 last_known_major = prev_major
-                print(f"cell found on channel {self.bf_channel} "
-                      f"at frame {frame} x {x:.1f} y {y:.1f}")
+                if initial_major_px is None:
+                    initial_major_px = prev_major
             else:
                 consecutive_misses += 1
                 if reject_reason:

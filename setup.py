@@ -8,7 +8,7 @@ setup(
     description='Python tool for tracking and measuring yeast cells in brightfield time-lapse microscopy.',
     long_description=open('README.md').read(),
     long_description_content_type='text/markdown',
-    url='https://github.com/MembraneEnzymology/PyBud',
+    url='https://github.com/molecular-systems-biology/PyBud',
     packages=find_packages(),
     install_requires=[
         'numpy',
